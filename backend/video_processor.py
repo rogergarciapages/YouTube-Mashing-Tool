@@ -129,21 +129,55 @@ class VideoProcessor:
         """
         Download a 3-second clip from YouTube starting at the specified timestamp
         """
+        # Convert HttpUrl to string if needed
+        url_str = str(url)
+        
+        # First, download the full video to a temporary file
+        temp_video = output_path.replace('.mp4', '_temp.mp4')
+        
         ydl_opts = {
             "format": "best[height<=1080]",  # Limit to 1080p max
-            "download_sections": {
-                "*": [{"start_time": timestamp, "end_time": timestamp + settings.CLIP_DURATION}]
-            },
-            "outtmpl": output_path,
+            "outtmpl": temp_video,
             "quiet": True,
             "no_warnings": True
         }
         
         try:
+            # Download the full video
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+                ydl.download([url_str])
+            
+            # Now extract the exact 3-second segment using FFmpeg
+            cmd = [
+                settings.FFMPEG_PATH,
+                "-i", temp_video,
+                "-ss", str(timestamp),  # Start at timestamp
+                "-t", str(settings.CLIP_DURATION),  # Duration of 3 seconds
+                "-c:v", "copy",  # Copy video codec (fast)
+                "-c:a", "copy",  # Copy audio codec (fast)
+                "-avoid_negative_ts", "make_zero",  # Handle timestamp issues
+                "-y",  # Overwrite output
+                output_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.info(f"FFmpeg clip extraction completed: {result.stdout}")
+            
+            # Clean up temporary file
+            if os.path.exists(temp_video):
+                os.remove(temp_video)
+                
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg clip extraction failed: {e.stderr}")
+            # Clean up on error
+            if os.path.exists(temp_video):
+                os.remove(temp_video)
+            raise Exception(f"Failed to extract video clip: {e.stderr}")
         except Exception as e:
-            logger.error(f"Error downloading clip from {url}: {e}")
+            logger.error(f"Error downloading video from {url_str}: {e}")
+            # Clean up on error
+            if os.path.exists(temp_video):
+                os.remove(temp_video)
             raise Exception(f"Failed to download video: {str(e)}")
     
     def _generate_summary(self, clip: ClipRequest) -> str:
@@ -166,17 +200,59 @@ class VideoProcessor:
         """
         Overlay text on video using FFmpeg
         """
-        # Escape text for FFmpeg
-        escaped_text = text.replace("'", "\\'").replace('"', '\\"')
-        
         # Calculate text position based on placement
         position = self._calculate_text_position(request.placement)
         
-        # Build FFmpeg command
+        # Use a simpler approach - create a text file for the text content
+        # This avoids all escaping issues with FFmpeg
+        # Get the directory from the output path more explicitly
+        output_dir = os.path.dirname(output_path)
+        text_file = os.path.join(output_dir, "text.txt")
+        
+        # Ensure the directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Debug: Log the actual paths being used
+        logger.info(f"Output path: {output_path}")
+        logger.info(f"Output directory: {output_dir}")
+        logger.info(f"Text file path: {text_file}")
+        
+        with open(text_file, "w", encoding="utf-8") as f:
+            f.write(text)
+        
+        # Verify the file was created and has content
+        if os.path.exists(text_file):
+            with open(text_file, "r", encoding="utf-8") as f:
+                file_content = f.read()
+            logger.info(f"Text file created successfully at: {text_file}")
+            logger.info(f"Text file content: {file_content}")
+            logger.info(f"Text file size: {os.path.getsize(text_file)} bytes")
+        else:
+            logger.error(f"Text file was not created at: {text_file}")
+            raise Exception(f"Failed to create text file at {text_file}")
+        
+        # Build FFmpeg command using textfile for reliable text handling
+        # Convert Windows backslashes to forward slashes for FFmpeg compatibility
+        text_file_ffmpeg = text_file.replace('\\', '/')
+        
+        # Use custom font with black outline (Mr Beast style)
+        font_path = os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT)
+        font_path_ffmpeg = font_path.replace('\\', '/')
+        
+        # Create filter with custom font and black outline
+        filter_complex = f'drawtext=textfile={text_file_ffmpeg}:fontfile={font_path_ffmpeg}:fontcolor={request.font_color}:fontsize={request.font_size}:{position}:borderw=4:bordercolor=black'
+        
+        # Debug logging
+        logger.info(f"Original text file path: {text_file}")
+        logger.info(f"FFmpeg-compatible text file path: {text_file_ffmpeg}")
+        logger.info(f"Font path: {font_path}")
+        logger.info(f"FFmpeg-compatible font path: {font_path_ffmpeg}")
+        logger.info(f"FFmpeg filter: {filter_complex}")
+        
         cmd = [
             settings.FFMPEG_PATH,
             "-i", input_path,
-            "-vf", f"drawtext=text='{escaped_text}':fontcolor={request.font_color}:fontsize={request.font_size}:{position}",
+            "-vf", filter_complex,
             "-codec:a", "copy",
             "-y",  # Overwrite output file
             output_path
@@ -185,8 +261,16 @@ class VideoProcessor:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             logger.debug(f"FFmpeg text overlay completed: {result.stdout}")
+            
+            # Clean up text file
+            if os.path.exists(text_file):
+                os.remove(text_file)
+                
         except subprocess.CalledProcessError as e:
             logger.error(f"FFmpeg text overlay failed: {e.stderr}")
+            # Clean up text file on error
+            if os.path.exists(text_file):
+                os.remove(text_file)
             raise Exception(f"Text overlay failed: {e.stderr}")
     
     def _calculate_text_position(self, placement: str) -> str:
@@ -197,8 +281,8 @@ class VideoProcessor:
             return "x=(w-text_w)/2:y=50"
         elif placement == "center":
             return "x=(w-text_w)/2:y=(h-text_h)/2"
-        else:  # bottom
-            return "x=(w-text_w)/2:y=h-50"
+        else:  # bottom - 80% from bottom (20% padding)
+            return "x=(w-text_w)/2:y=h*0.8-text_h/2"
     
     def _format_video(self, input_path: str, output_path: str, format_type: VideoFormat):
         """
@@ -229,29 +313,54 @@ class VideoProcessor:
         """
         Stitch multiple clips together using FFmpeg concat
         """
+        # Debug: Log all clip paths being stitched
+        logger.info(f"Stitching {len(clip_paths)} clips together")
+        for i, clip_path in enumerate(clip_paths):
+            logger.info(f"Clip {i}: {clip_path}")
+            if os.path.exists(clip_path):
+                file_size = os.path.getsize(clip_path)
+                logger.info(f"Clip {i} exists, size: {file_size} bytes")
+            else:
+                logger.warning(f"Clip {i} does not exist: {clip_path}")
+        
         # Create concat file
         concat_file = os.path.join(settings.TEMP_DIR, "concat_list.txt")
         with open(concat_file, "w") as f:
             for clip_path in clip_paths:
                 f.write(f"file '{clip_path}'\n")
         
+        # Log the concat file contents
+        with open(concat_file, "r") as f:
+            concat_contents = f.read()
+        logger.info(f"Concat file contents:\n{concat_contents}")
+        
         # Output path for stitched video
         stitched_path = os.path.join(settings.TEMP_DIR, "stitched.mp4")
         
-        # FFmpeg concat command
+        # FFmpeg concat command - use re-encoding for better compatibility
         cmd = [
             settings.FFMPEG_PATH,
             "-f", "concat",
             "-safe", "0",
             "-i", concat_file,
-            "-c", "copy",
+            "-c:v", "libx264",  # Re-encode video for better compatibility
+            "-c:a", "aac",       # Re-encode audio for better compatibility
+            "-preset", "fast",   # Fast encoding
+            "-crf", "23",        # Good quality
             "-y",
             stitched_path
         ]
         
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            logger.debug(f"Video stitching completed: {result.stdout}")
+            logger.info(f"Video stitching completed: {result.stdout}")
+            
+            # Verify the output file
+            if os.path.exists(stitched_path):
+                final_size = os.path.getsize(stitched_path)
+                logger.info(f"Stitched video created successfully, size: {final_size} bytes")
+            else:
+                logger.error("Stitched video file was not created")
             
             # Clean up concat file
             os.remove(concat_file)
@@ -260,6 +369,9 @@ class VideoProcessor:
             
         except subprocess.CalledProcessError as e:
             logger.error(f"Video stitching failed: {e.stderr}")
+            # Clean up on error
+            if os.path.exists(concat_file):
+                os.remove(concat_file)
             raise Exception(f"Video stitching failed: {e.stderr}")
     
     def _add_background_music(self, video_path: str, music_path: str) -> str:

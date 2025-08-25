@@ -17,7 +17,7 @@ export default function Settings({ settings, onSettingsChange }: SettingsProps) 
   }
 
   const fontOptions = [
-    'Arial', 'Helvetica', 'Times New Roman', 'Georgia', 'Verdana',
+    'KOMIKAX_.ttf', 'Arial', 'Helvetica', 'Times New Roman', 'Georgia', 'Verdana',
     'Courier New', 'Impact', 'Comic Sans MS', 'Tahoma', 'Trebuchet MS'
   ]
 
@@ -101,6 +101,11 @@ export default function Settings({ settings, onSettingsChange }: SettingsProps) 
                 {settings.font_size}px
               </div>
             </div>
+          </div>
+          
+          {/* Font Info */}
+          <div className="text-xs text-gray-500 bg-blue-50 p-2 rounded border border-blue-200">
+            <strong>Mr Beast Style:</strong> KOMIKAX_.ttf includes a 4px black outline for maximum readability
           </div>
         </div>
 

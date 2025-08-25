@@ -17,7 +17,7 @@ class AIClient:
             self.available = True
             try:
                 # Test the API connection
-                model = genai.GenerativeModel("gemini-pro")
+                model = genai.GenerativeModel("gemini-1.5-flash")
                 logger.info("Google AI Studio connection established")
             except Exception as e:
                 logger.error(f"Failed to connect to Google AI Studio: {e}")
@@ -45,7 +45,7 @@ class AIClient:
             Return only the description, nothing else.
             """
             
-            model = genai.GenerativeModel("gemini-pro")
+            model = genai.GenerativeModel("gemini-1.5-flash")
             response = model.generate_content(prompt)
             
             summary = response.text.strip()

@@ -20,7 +20,7 @@ class Settings:
     OUTPUT_DIR: str = "videos/output"
     
     # Font Configuration
-    DEFAULT_FONT: str = "Arial"
+    DEFAULT_FONT: str = "KOMIKAX_.ttf"  # Mr Beast's Komika Axis font
     FONT_DIR: str = "fonts"
     
     # Video Formats
@@ -31,7 +31,7 @@ class Settings:
     }
     
     # FFmpeg Configuration
-    FFMPEG_PATH: str = "ffmpeg"  # Assumes ffmpeg is in PATH
+    FFMPEG_PATH: str = os.getenv("FFMPEG_PATH", "ffmpeg")  # Can be set via environment variable
     
     # Processing Configuration
     MAX_PROCESSING_TIME: int = 300  # 5 minutes
