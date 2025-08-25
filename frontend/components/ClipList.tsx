@@ -14,14 +14,20 @@ export default function ClipList({ clips, onRemoveClip, onUpdateClip }: ClipList
   const [editingIndex, setEditingIndex] = useState<number | null>(null)
   const [editForm, setEditForm] = useState<ClipRequest>({
     url: '',
-    timestamp: 0,
+    timestamp: 0, // Will be extracted from URL when saving
     keywords: '',
     custom_text: ''
   })
 
   const startEditing = (index: number) => {
     setEditingIndex(index)
-    setEditForm(clips[index])
+    // Don't include timestamp in edit form since it will be extracted from URL
+    setEditForm({
+      url: clips[index].url,
+      timestamp: 0, // This will be extracted when saving
+      keywords: clips[index].keywords || '',
+      custom_text: clips[index].custom_text || ''
+    })
   }
 
   const cancelEditing = () => {
@@ -34,9 +40,47 @@ export default function ClipList({ clips, onRemoveClip, onUpdateClip }: ClipList
     })
   }
 
+  const extractTimestampFromUrl = (url: string): number | null => {
+    try {
+      const urlObj = new URL(url)
+      const searchParams = urlObj.searchParams
+      
+      // Check for 't' parameter (timestamp in seconds)
+      const timestamp = searchParams.get('t')
+      if (timestamp) {
+        const seconds = parseInt(timestamp)
+        return isNaN(seconds) || seconds < 0 ? null : seconds
+      }
+      
+      // Check for 'si' parameter which sometimes contains timestamp
+      const si = searchParams.get('si')
+      if (si) {
+        // Extract timestamp from si parameter if it exists
+        const match = si.match(/t=(\d+)/)
+        if (match) {
+          const seconds = parseInt(match[1])
+          return isNaN(seconds) || seconds < 0 ? null : seconds
+        }
+      }
+      
+      return null
+    } catch {
+      return null
+    }
+  }
+
   const saveEdit = () => {
     if (editingIndex !== null) {
-      onUpdateClip(editingIndex, editForm)
+      // Extract timestamp from URL
+      const timestamp = extractTimestampFromUrl(editForm.url)
+      if (timestamp === null) {
+        alert('Failed to extract timestamp from URL. Please ensure the URL contains a timestamp (e.g., ?t=120)')
+        return
+      }
+      
+      // Update the editForm with the extracted timestamp
+      const updatedClip = { ...editForm, timestamp }
+      onUpdateClip(editingIndex, updatedClip)
       setEditingIndex(null)
     }
   }
@@ -94,17 +138,8 @@ export default function ClipList({ clips, onRemoveClip, onUpdateClip }: ClipList
                   />
                 </div>
                 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Timestamp (seconds)
-                  </label>
-                  <input
-                    type="number"
-                    value={editForm.timestamp}
-                    onChange={(e) => setEditForm(prev => ({ ...prev, timestamp: parseInt(e.target.value) || 0 }))}
-                    className="input-field"
-                    min="0"
-                  />
+                <div className="text-xs text-gray-500 bg-blue-50 p-2 rounded border border-blue-200">
+                  <strong>Timestamp:</strong> Will be automatically extracted from the YouTube URL
                 </div>
                 
                 <div>

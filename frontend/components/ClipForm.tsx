@@ -11,7 +11,6 @@ interface ClipFormProps {
 export default function ClipForm({ onAddClip }: ClipFormProps) {
   const [formData, setFormData] = useState({
     url: '',
-    timestamp: '',
     keywords: '',
     custom_text: ''
   })
@@ -24,14 +23,11 @@ export default function ClipForm({ onAddClip }: ClipFormProps) {
       newErrors.url = 'YouTube URL is required'
     } else if (!isValidYouTubeUrl(formData.url)) {
       newErrors.url = 'Please enter a valid YouTube URL'
-    }
-
-    if (!formData.timestamp.trim()) {
-      newErrors.timestamp = 'Timestamp is required'
     } else {
-      const timestamp = parseInt(formData.timestamp)
-      if (isNaN(timestamp) || timestamp < 0) {
-        newErrors.timestamp = 'Timestamp must be a positive number'
+      // Check if URL contains a timestamp
+      const timestamp = extractTimestampFromUrl(formData.url)
+      if (timestamp === null) {
+        newErrors.url = 'YouTube URL must contain a timestamp (e.g., ?t=120 or &t=120)'
       }
     }
 
@@ -48,6 +44,35 @@ export default function ClipForm({ onAddClip }: ClipFormProps) {
     return youtubeRegex.test(url)
   }
 
+  const extractTimestampFromUrl = (url: string): number | null => {
+    try {
+      const urlObj = new URL(url)
+      const searchParams = urlObj.searchParams
+      
+      // Check for 't' parameter (timestamp in seconds)
+      const timestamp = searchParams.get('t')
+      if (timestamp) {
+        const seconds = parseInt(timestamp)
+        return isNaN(seconds) || seconds < 0 ? null : seconds
+      }
+      
+      // Check for 'si' parameter which sometimes contains timestamp
+      const si = searchParams.get('si')
+      if (si) {
+        // Extract timestamp from si parameter if it exists
+        const match = si.match(/t=(\d+)/)
+        if (match) {
+          const seconds = parseInt(match[1])
+          return isNaN(seconds) || seconds < 0 ? null : seconds
+        }
+      }
+      
+      return null
+    } catch {
+      return null
+    }
+  }
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     
@@ -55,9 +80,15 @@ export default function ClipForm({ onAddClip }: ClipFormProps) {
       return
     }
 
+    const timestamp = extractTimestampFromUrl(formData.url)
+    if (timestamp === null) {
+      setErrors({ url: 'Failed to extract timestamp from URL' })
+      return
+    }
+
     const clip: ClipRequest = {
       url: formData.url.trim(),
-      timestamp: parseInt(formData.timestamp),
+      timestamp: timestamp,
       keywords: formData.keywords.trim() || undefined,
       custom_text: formData.custom_text.trim() || undefined
     }
@@ -67,7 +98,6 @@ export default function ClipForm({ onAddClip }: ClipFormProps) {
     // Reset form
     setFormData({
       url: '',
-      timestamp: '',
       keywords: '',
       custom_text: ''
     })
@@ -114,26 +144,9 @@ export default function ClipForm({ onAddClip }: ClipFormProps) {
           )}
         </div>
 
-        {/* Timestamp */}
-        <div>
-          <label htmlFor="timestamp" className="block text-sm font-medium text-gray-700 mb-1">
-            Start Time (seconds) *
-          </label>
-          <input
-            type="number"
-            id="timestamp"
-            value={formData.timestamp}
-            onChange={(e) => handleInputChange('timestamp', e.target.value)}
-            placeholder="45"
-            min="0"
-            className={`input-field ${errors.timestamp ? 'border-red-300 focus:ring-red-500' : ''}`}
-          />
-          {errors.timestamp && (
-            <p className="text-sm text-red-600 mt-1">{errors.timestamp}</p>
-          )}
-          <p className="text-xs text-gray-500 mt-1">
-            Enter the time in seconds when you want the clip to start
-          </p>
+        {/* Timestamp Info */}
+        <div className="text-xs text-gray-500 bg-blue-50 p-2 rounded border border-blue-200">
+          <strong>Timestamp:</strong> The start time will be automatically extracted from your YouTube URL (e.g., ?t=120 means start at 2 minutes)
         </div>
 
         {/* Keywords */}

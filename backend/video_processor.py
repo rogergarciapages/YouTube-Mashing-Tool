@@ -119,7 +119,10 @@ class VideoProcessor:
             # 4. Format video to target dimensions
             self._format_video(styled_clip, final_clip, request.format)
             
-            return final_clip
+            # 5. Normalize timestamps to ensure proper concatenation
+            normalized_clip = self._normalize_timestamps(final_clip, temp_dir)
+            
+            return normalized_clip
             
         except Exception as e:
             logger.error(f"Error processing clip {index}: {e}")
@@ -148,14 +151,19 @@ class VideoProcessor:
                 ydl.download([url_str])
             
             # Now extract the exact 3-second segment using FFmpeg
+            # Use re-encoding to ensure proper timestamp handling
+            # MUTE the audio completely
             cmd = [
                 settings.FFMPEG_PATH,
                 "-i", temp_video,
                 "-ss", str(timestamp),  # Start at timestamp
                 "-t", str(settings.CLIP_DURATION),  # Duration of 3 seconds
-                "-c:v", "copy",  # Copy video codec (fast)
-                "-c:a", "copy",  # Copy audio codec (fast)
-                "-avoid_negative_ts", "make_zero",  # Handle timestamp issues
+                "-c:v", "libx264",  # Re-encode video for timestamp accuracy
+                "-an",               # Remove audio completely (mute)
+                "-preset", "fast",   # Fast encoding
+                "-crf", "23",        # Good quality
+                "-avoid_negative_ts", "make_zero",  # Reset timestamps
+                "-vsync", "cfr",     # Constant frame rate
                 "-y",  # Overwrite output
                 output_path
             ]
@@ -198,13 +206,11 @@ class VideoProcessor:
     
     def _overlay_text(self, input_path: str, output_path: str, text: str, request: VideoRequest):
         """
-        Overlay text on video using FFmpeg
+        Overlay text on video using FFmpeg with text wrapping
         """
         # Calculate text position based on placement
         position = self._calculate_text_position(request.placement)
         
-        # Use a simpler approach - create a text file for the text content
-        # This avoids all escaping issues with FFmpeg
         # Get the directory from the output path more explicitly
         output_dir = os.path.dirname(output_path)
         text_file = os.path.join(output_dir, "text.txt")
@@ -212,13 +218,18 @@ class VideoProcessor:
         # Ensure the directory exists
         os.makedirs(output_dir, exist_ok=True)
         
+        # Create wrapped text with line breaks
+        wrapped_text = self._wrap_text(text, request.font_size)
+        
         # Debug: Log the actual paths being used
         logger.info(f"Output path: {output_path}")
         logger.info(f"Output directory: {output_dir}")
         logger.info(f"Text file path: {text_file}")
+        logger.info(f"Original text: {text}")
+        logger.info(f"Wrapped text: {wrapped_text}")
         
         with open(text_file, "w", encoding="utf-8") as f:
-            f.write(text)
+            f.write(wrapped_text)
         
         # Verify the file was created and has content
         if os.path.exists(text_file):
@@ -239,8 +250,8 @@ class VideoProcessor:
         font_path = os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT)
         font_path_ffmpeg = font_path.replace('\\', '/')
         
-        # Create filter with custom font and black outline
-        filter_complex = f'drawtext=textfile={text_file_ffmpeg}:fontfile={font_path_ffmpeg}:fontcolor={request.font_color}:fontsize={request.font_size}:{position}:borderw=4:bordercolor=black'
+        # Create filter with custom font, black outline, and line spacing
+        filter_complex = f'drawtext=textfile={text_file_ffmpeg}:fontfile={font_path_ffmpeg}:fontcolor={request.font_color}:fontsize={request.font_size}:{position}:borderw=4:bordercolor=black:line_spacing=10'
         
         # Debug logging
         logger.info(f"Original text file path: {text_file}")
@@ -253,7 +264,7 @@ class VideoProcessor:
             settings.FFMPEG_PATH,
             "-i", input_path,
             "-vf", filter_complex,
-            "-codec:a", "copy",
+            "-an",               # Remove audio (mute)
             "-y",  # Overwrite output file
             output_path
         ]
@@ -278,12 +289,93 @@ class VideoProcessor:
         Calculate text position for FFmpeg drawtext filter
         """
         if placement == "top":
-            return "x=(w-text_w)/2:y=50"
+            return "x=w*0.075:y=50"  # 7.5% from left
         elif placement == "center":
-            return "x=(w-text_w)/2:y=(h-text_h)/2"
-        else:  # bottom - 80% from bottom (20% padding)
-            return "x=(w-text_w)/2:y=h*0.8-text_h/2"
+            return "x=w*0.075:y=(h-text_h)/2"  # 7.5% from left, center vertically
+        else:  # bottom - 80% from bottom, 7.5% from left
+            return "x=w*0.075:y=h*0.8-text_h/2"
     
+    def _wrap_text(self, text: str, font_size: int) -> str:
+        """
+        Wrap text to fit within video width with 7.5% padding on both sides
+        Estimated characters per line based on font size and video width
+        """
+        # Estimate characters per line based on font size
+        # This is a rough estimation - adjust as needed
+        if font_size <= 24:
+            chars_per_line = 40
+        elif font_size <= 36:
+            chars_per_line = 30
+        elif font_size <= 48:
+            chars_per_line = 25
+        else:
+            chars_per_line = 20
+        
+        # Split text into words
+        words = text.split()
+        lines = []
+        current_line = ""
+        
+        for word in words:
+            # Check if adding this word would exceed the line limit
+            if len(current_line + " " + word) <= chars_per_line:
+                if current_line:
+                    current_line += " " + word
+                else:
+                    current_line = word
+            else:
+                # Add current line to lines and start new line
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+        
+        # Add the last line if it exists
+        if current_line:
+            lines.append(current_line)
+        
+        # Join lines with newline characters for FFmpeg
+        wrapped_text = "\n".join(lines)
+        
+        logger.info(f"Text wrapping: {len(words)} words, {len(lines)} lines, ~{chars_per_line} chars per line")
+        
+        return wrapped_text
+    
+    def _normalize_timestamps(self, input_path: str, temp_dir: str) -> str:
+        """
+        Normalize video timestamps to start at 0 for proper concatenation
+        """
+        normalized_path = os.path.join(temp_dir, "normalized.mp4")
+        
+        # FFmpeg command to reset timestamps and ensure proper sync
+        cmd = [
+            settings.FFMPEG_PATH,
+            "-i", input_path,
+            "-c:v", "copy",        # Copy video stream
+            "-c:a", "copy",        # Copy audio stream
+            "-avoid_negative_ts", "make_zero",  # Reset timestamps to 0
+            "-fflags", "+genpts",  # Generate presentation timestamps
+            "-y",
+            normalized_path
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.debug(f"Timestamp normalization completed: {result.stdout}")
+            
+            # Verify the normalized file
+            if os.path.exists(normalized_path):
+                file_size = os.path.getsize(normalized_path)
+                logger.info(f"Normalized clip created, size: {file_size} bytes")
+                return normalized_path
+            else:
+                logger.warning("Normalized clip not created, using original")
+                return input_path
+                
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Timestamp normalization failed: {e.stderr}")
+            logger.warning("Using original clip due to normalization failure")
+            return input_path
+
     def _format_video(self, input_path: str, output_path: str, format_type: VideoFormat):
         """
         Format video to target dimensions with padding if necessary
@@ -297,7 +389,7 @@ class VideoProcessor:
             settings.FFMPEG_PATH,
             "-i", input_path,
             "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
-            "-c:a", "copy",
+            "-an",               # Remove audio (mute)
             "-y",
             output_path
         ]
@@ -320,45 +412,103 @@ class VideoProcessor:
             if os.path.exists(clip_path):
                 file_size = os.path.getsize(clip_path)
                 logger.info(f"Clip {i} exists, size: {file_size} bytes")
+                
+                # Verify the clip is a valid video file
+                if file_size < 10000:  # Less than 10KB is suspicious
+                    logger.warning(f"Clip {i} seems too small ({file_size} bytes), may be corrupted")
+                
+                # Try to get video info for each clip
+                probe_cmd = [
+                    settings.FFMPEG_PATH,
+                    "-i", clip_path,
+                    "-hide_banner"
+                ]
+                try:
+                    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+                    logger.info(f"Clip {i} video info: {probe_result.stderr}")  # FFmpeg outputs info to stderr
+                except Exception as probe_e:
+                    logger.error(f"Failed to probe clip {i}: {probe_e}")
+                    
             else:
                 logger.warning(f"Clip {i} does not exist: {clip_path}")
         
-        # Create concat file
+        # Create concat file with absolute paths to avoid path resolution issues
         concat_file = os.path.join(settings.TEMP_DIR, "concat_list.txt")
         with open(concat_file, "w") as f:
             for clip_path in clip_paths:
-                f.write(f"file '{clip_path}'\n")
+                # Use absolute path to avoid FFmpeg path resolution issues
+                absolute_path = os.path.abspath(clip_path)
+                # Convert Windows backslashes to forward slashes for FFmpeg compatibility
+                ffmpeg_path = absolute_path.replace('\\', '/')
+                f.write(f"file '{ffmpeg_path}'\n")
         
         # Log the concat file contents
         with open(concat_file, "r") as f:
             concat_contents = f.read()
         logger.info(f"Concat file contents:\n{concat_contents}")
         
+        # Also log the working directory and verify file existence
+        current_dir = os.getcwd()
+        logger.info(f"Current working directory: {current_dir}")
+        
+        for i, clip_path in enumerate(clip_paths):
+            absolute_path = os.path.abspath(clip_path)
+            logger.info(f"Clip {i} absolute path: {absolute_path}")
+            logger.info(f"Clip {i} exists (absolute): {os.path.exists(absolute_path)}")
+            logger.info(f"Clip {i} exists (relative): {os.path.exists(clip_path)}")
+        
         # Output path for stitched video
         stitched_path = os.path.join(settings.TEMP_DIR, "stitched.mp4")
         
-        # FFmpeg concat command - use re-encoding for better compatibility
+        # FFmpeg concat command - use stream copy for better compatibility
+        # Convert concat file path to forward slashes for FFmpeg compatibility
+        concat_file_ffmpeg = concat_file.replace('\\', '/')
+        
+        # First, try with stream copy (fastest and most reliable)
         cmd = [
             settings.FFMPEG_PATH,
             "-f", "concat",
             "-safe", "0",
-            "-i", concat_file,
-            "-c:v", "libx264",  # Re-encode video for better compatibility
-            "-c:a", "aac",       # Re-encode audio for better compatibility
-            "-preset", "fast",   # Fast encoding
-            "-crf", "23",        # Good quality
+            "-i", concat_file_ffmpeg,
+            "-c:v", "copy",      # Copy video stream
+            "-an",                # No audio (muted clips)
+            "-avoid_negative_ts", "make_zero",  # Handle timestamp issues
+            "-fflags", "+genpts",  # Generate presentation timestamps
             "-y",
             stitched_path
         ]
         
+        # Log the final command for debugging
+        logger.info(f"FFmpeg command (stream copy): {' '.join(cmd)}")
+        
+        # Log the final command for debugging
+        logger.info(f"FFmpeg command: {' '.join(cmd)}")
+        
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            logger.info(f"Video stitching completed: {result.stdout}")
+            logger.info(f"Video stitching completed (stream copy): {result.stdout}")
             
             # Verify the output file
             if os.path.exists(stitched_path):
                 final_size = os.path.getsize(stitched_path)
                 logger.info(f"Stitched video created successfully, size: {final_size} bytes")
+                
+                # Check if the file is actually a valid video
+                if final_size < 100000:  # Less than 100KB is suspicious
+                    logger.warning(f"Stitched video seems too small ({final_size} bytes), may be corrupted")
+                    
+                    # Try to get video info
+                    probe_cmd = [
+                        settings.FFMPEG_PATH,
+                        "-i", stitched_path,
+                        "-hide_banner"
+                    ]
+                    try:
+                        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+                        logger.info(f"Video probe result: {probe_result.stderr}")  # FFmpeg outputs info to stderr
+                    except Exception as probe_e:
+                        logger.error(f"Failed to probe video: {probe_e}")
+                
             else:
                 logger.error("Stitched video file was not created")
             
@@ -368,11 +518,46 @@ class VideoProcessor:
             return stitched_path
             
         except subprocess.CalledProcessError as e:
-            logger.error(f"Video stitching failed: {e.stderr}")
-            # Clean up on error
-            if os.path.exists(concat_file):
+            logger.error(f"Video stitching failed with stream copy: {e.stderr}")
+            logger.info("Attempting fallback with re-encoding...")
+            
+            # Fallback: try with re-encoding
+            fallback_cmd = [
+                settings.FFMPEG_PATH,
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_file_ffmpeg,
+                "-c:v", "libx264",  # Re-encode video
+                "-an",               # No audio (muted clips)
+                "-preset", "fast",   # Fast encoding
+                "-crf", "23",        # Good quality
+                "-y",
+                stitched_path
+            ]
+            
+            logger.info(f"Fallback FFmpeg command: {' '.join(fallback_cmd)}")
+            
+            try:
+                fallback_result = subprocess.run(fallback_cmd, capture_output=True, text=True, check=True)
+                logger.info(f"Video stitching completed (fallback): {fallback_result.stdout}")
+                
+                # Verify the output file
+                if os.path.exists(stitched_path):
+                    final_size = os.path.getsize(stitched_path)
+                    logger.info(f"Stitched video created successfully (fallback), size: {final_size} bytes")
+                else:
+                    logger.error("Stitched video file was not created (fallback)")
+                
+                # Clean up concat file
                 os.remove(concat_file)
-            raise Exception(f"Video stitching failed: {e.stderr}")
+                return stitched_path
+                
+            except subprocess.CalledProcessError as fallback_e:
+                logger.error(f"Video stitching failed with fallback: {fallback_e.stderr}")
+                # Clean up on error
+                if os.path.exists(concat_file):
+                    os.remove(concat_file)
+                raise Exception(f"Video stitching failed with both methods: {e.stderr} | Fallback: {fallback_e.stderr}")
     
     def _add_background_music(self, video_path: str, music_path: str) -> str:
         """
