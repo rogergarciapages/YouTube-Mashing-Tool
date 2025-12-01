@@ -169,24 +169,26 @@ class VideoProcessor:
         temp_dir = os.path.dirname(output_path)
         temp_video = os.path.join(temp_dir, f"temp_{os.path.basename(output_path)}")
         
+        # Use an explicit template with extension to make the downloaded filename predictable
         ydl_opts = {
-            # Video-only formats: 1080p > 720p > 480p, prefer MP4, NO audio
+            # Video-only formats: prefer MP4 and high resolution
             "format": "bestvideo[height>=720][ext=mp4]/bestvideo[height>=720]/best[height>=720]/best[ext=mp4]/best",
-            "outtmpl": temp_video,
+            "outtmpl": temp_video + ".%(ext)s",
             "quiet": True,
             "no_warnings": True,
-            # No need for audio merging since we mute everything
-            "noplaylist": True
+            "noplaylist": True,
+            # Improve robustness
+            "retries": 3,
+            "socket_timeout": 15,
+            "http_chunk_size": 1048576,
         }
-        
-        try:
-            # Download the full video
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+        def _run_ydl_with_opts(opts):
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 # Get video info first to log quality
                 try:
                     info = ydl.extract_info(url_str, download=False)
                     if 'formats' in info and info['formats']:
-                        # Find best format that was selected
                         formats = info['formats']
                         best_format = None
                         for fmt in formats:
@@ -205,9 +207,34 @@ class VideoProcessor:
                         logger.info("Video info extracted, format details not available")
                 except Exception as info_e:
                     logger.warning(f"Could not extract video info: {info_e}")
-                
+
                 # Download the video
                 ydl.download([url_str])
+
+        try:
+            # First attempt: default options
+            _run_ydl_with_opts(ydl_opts)
+        except Exception as e:
+            logger.warning(f"Initial yt-dlp download attempt failed: {e}")
+            # If it's a 403 or similar access issue, attempt a fallback with browser-like headers
+            try:
+                fallback_opts = ydl_opts.copy()
+                # Set a modern browser user-agent and referer to mimic a real browser
+                fallback_opts.update({
+                    "http_headers": {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                        "Referer": url_str
+                    },
+                    "nocheckcertificate": True,
+                    "geo_bypass": True,
+                    "retries": 5,
+                    "socket_timeout": 30,
+                })
+                logger.info("Attempting yt-dlp download with fallback headers and geo-bypass")
+                _run_ydl_with_opts(fallback_opts)
+            except Exception as e2:
+                logger.error(f"Fallback yt-dlp download also failed: {e2}")
+                raise
             
             # Check if the temp file was created with the expected name
             # yt-dlp might add extensions or modify the filename
