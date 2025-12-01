@@ -1328,163 +1328,166 @@ class VideoProcessor:
             self._save_tasks_to_disk()
     
     def _create_intro_clip(self, first_clip_path: str, request: VideoRequest) -> str:
-         """
-         Create a 2-second blurred intro clip from the first video with title overlay
-         """
-         try:
-             intro_path = os.path.join(settings.TEMP_DIR, "intro.mp4")
-             
-             # Get target dimensions based on the selected format
-             format_info = settings.VIDEO_FORMATS[request.format]
-             target_width = format_info["width"]
-             target_height = format_info["height"]
-             
-             # Adjust font size based on format (smaller for vertical formats)
-             if request.format == "shorts":
-                 font_size = 48  # Smaller font for vertical format
-             else:
-                 font_size = 72  # Standard font size for horizontal formats
-            
+        """
+        Create a 2-second blurred intro clip from the first video with title overlay
+        """
+        try:
+            intro_path = os.path.join(settings.TEMP_DIR, "intro.mp4")
+
+            # Get target dimensions based on the selected format
+            format_info = settings.VIDEO_FORMATS[request.format]
+            target_width = format_info["width"]
+            target_height = format_info["height"]
+
+            # Adjust font size based on format (smaller for vertical formats)
+            if request.format == "shorts":
+                font_size = 48  # Smaller font for vertical format
+            else:
+                font_size = 72  # Standard font size for horizontal formats
+
             # Normalize font path for FFmpeg (use forward slashes)
             fontfile = os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT).replace('\\', '/')
-             
-             # Extract 2 seconds from the beginning of the first clip
-             # Apply heavy blur effect and overlay title text
-             # Use the same formatting logic as the main video
-             if request.format == "shorts":
-                 # For YouTube Shorts: Crop from sides, maintain center content
-                 filter_complex = (
-                     f"crop=iw*9/16:ih:(iw-iw*9/16)/2:0,"  # Crop to 9:16 ratio, center horizontally
-                     f"scale={target_width}:{target_height},"  # Scale to target dimensions
-                     f"boxblur=20:20,"  # Apply blur effect
-                     f"drawtext=text='{request.title}':fontfile={fontfile}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
-                 )
-             elif request.format == "instagram":
-                 # For Instagram: Crop to square, center
-                 filter_complex = (
-                     f"crop=min(iw,ih):min(iw,ih):(iw-min(iw,ih))/2:(ih-min(iw,ih))/2,"  # Crop to square, center
-                     f"scale={target_width}:{target_height},"  # Scale to target dimensions
-                     f"boxblur=20:20,"  # Apply blur effect
-                     f"drawtext=text='{request.title}':fontfile={fontfile}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
-                 )
-             else:
-                 # For YouTube: Standard scaling with padding
-                 filter_complex = f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,boxblur=20:20,drawtext=text='{request.title}':fontfile={fontfile}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
-             
-             cmd = [
-                 settings.FFMPEG_PATH,
-                 "-i", first_clip_path,
-                 "-t", "2",  # 2 seconds duration
-                 "-vf", filter_complex,
-                 "-c:v", "libx264",
-                 "-preset", "ultrafast",  # Fastest encoding for speed
-                 "-crf", "28",            # Slightly lower quality for speed
-                 "-threads", "0",         # Use all available CPU threads
-                 "-an",  # No audio
-                 "-y",
-                 intro_path
-             ]
-             
-             logger.info(f"Creating intro clip: {' '.join(cmd)}")
-             logger.info(f"Intro output path: {intro_path}")
-             logger.info(f"First clip path: {first_clip_path}")
-             logger.info(f"First clip exists: {os.path.exists(first_clip_path)}")
-             
-             result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
-             logger.info(f"Intro clip created successfully: {result.stdout}")
-             
-             # Verify the intro file was created
-             if os.path.exists(intro_path):
-                 intro_size = os.path.getsize(intro_path)
-                 logger.info(f"Intro clip created at {intro_path}, size: {intro_size} bytes")
-             else:
-                 logger.error(f"Intro clip was not created at {intro_path}")
-             
-             return intro_path
-             
-         except Exception as e:
-             logger.error(f"Failed to create intro clip: {e}")
-             # Fallback: return first clip if intro creation fails
-             return first_clip_path
+
+            # Extract 2 seconds from the beginning of the first clip
+            # Apply heavy blur effect and overlay title text
+            # Use the same formatting logic as the main video
+            if request.format == "shorts":
+                # For YouTube Shorts: Crop from sides, maintain center content
+                filter_complex = (
+                    f"crop=iw*9/16:ih:(iw-iw*9/16)/2:0,"  # Crop to 9:16 ratio, center horizontally
+                    f"scale={target_width}:{target_height},"  # Scale to target dimensions
+                    f"boxblur=20:20,"  # Apply blur effect
+                    f"drawtext=text='{request.title}':fontfile={fontfile}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
+                )
+            elif request.format == "instagram":
+                # For Instagram: Crop to square, center
+                filter_complex = (
+                    f"crop=min(iw,ih):min(iw,ih):(iw-min(iw,ih))/2:(ih-min(iw,ih))/2,"  # Crop to square, center
+                    f"scale={target_width}:{target_height},"  # Scale to target dimensions
+                    f"boxblur=20:20,"  # Apply blur effect
+                    f"drawtext=text='{request.title}':fontfile={fontfile}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
+                )
+            else:
+                # For YouTube: Standard scaling with padding
+                filter_complex = f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,boxblur=20:20,drawtext=text='{request.title}':fontfile={fontfile}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
+
+            cmd = [
+                settings.FFMPEG_PATH,
+                "-i", first_clip_path,
+                "-t", "2",  # 2 seconds duration
+                "-vf", filter_complex,
+                "-c:v", "libx264",
+                "-preset", "ultrafast",  # Fastest encoding for speed
+                "-crf", "28",            # Slightly lower quality for speed
+                "-threads", "0",         # Use all available CPU threads
+                "-an",  # No audio
+                "-y",
+                intro_path
+            ]
+
+            logger.info(f"Creating intro clip: {' '.join(cmd)}")
+            logger.info(f"Intro output path: {intro_path}")
+            logger.info(f"First clip path: {first_clip_path}")
+            logger.info(f"First clip exists: {os.path.exists(first_clip_path)}")
+
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
+            logger.info(f"Intro clip created successfully: {result.stdout}")
+
+            # Verify the intro file was created
+            if os.path.exists(intro_path):
+                intro_size = os.path.getsize(intro_path)
+                logger.info(f"Intro clip created at {intro_path}, size: {intro_size} bytes")
+            else:
+                logger.error(f"Intro clip was not created at {intro_path}")
+
+            return intro_path
+
+        except Exception as e:
+            logger.error(f"Failed to create intro clip: {e}")
+            # Fallback: return first clip if intro creation fails
+            return first_clip_path
     
     def _create_outro_clip(self, first_clip_path: str, request: VideoRequest) -> str:
-         """
-         Create a 2-second blurred outro clip from the first video with subscribe message
-         """
-         try:
-             outro_path = os.path.join(settings.TEMP_DIR, "outro.mp4")
-             
-             # Get target dimensions based on the selected format
-             format_info = settings.VIDEO_FORMATS[request.format]
-             target_width = format_info["width"]
-             target_height = format_info["height"]
-             
-             # Adjust font size based on format (smaller for vertical formats)
-             if request.format == "shorts":
-                 font_size = 48  # Smaller font for vertical format
-             else:
-                 font_size = 72  # Standard font size for horizontal formats
-             
-             # Extract 2 seconds from the beginning of the first clip
-             # Apply heavy blur effect and overlay subscribe message
-             # Use the same formatting logic as the main video
-             subscribe_text = "SUBSCRIBE FOR MORE!"
-             
-             if request.format == "shorts":
-                 # For YouTube Shorts: Crop from sides, maintain center content
-                 filter_complex = (
-                     f"crop=iw*9/16:ih:(iw-iw*9/16)/2:0,"  # Crop to 9:16 ratio, center horizontally
-                     f"scale={target_width}:{target_height},"  # Scale to target dimensions
-                     f"boxblur=20:20,"  # Apply blur effect
-                     f"drawtext=text='{subscribe_text}':fontfile={os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT).replace('\\', '/')}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
-                 )
-             elif request.format == "instagram":
-                 # For Instagram: Crop to square, center
-                 filter_complex = (
-                     f"crop=min(iw,ih):min(iw,ih):(iw-min(iw,ih))/2:(ih-min(iw,ih))/2,"  # Crop to square, center
-                     f"scale={target_width}:{target_height},"  # Scale to target dimensions
-                     f"boxblur=20:20,"  # Apply blur effect
-                     f"drawtext=text='{subscribe_text}':fontfile={os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT).replace('\\', '/')}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
-                 )
-             else:
-                 # For YouTube: Standard scaling with padding
-                 filter_complex = f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,boxblur=20:20,drawtext=text='{subscribe_text}':fontfile={os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT).replace('\\', '/')}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
-             
-             cmd = [
-                 settings.FFMPEG_PATH,
-                 "-i", first_clip_path,
-                 "-t", "2",  # 2 seconds duration
-                 "-vf", filter_complex,
-                 "-c:v", "libx264",
-                 "-preset", "ultrafast",  # Fastest encoding for speed
-                 "-crf", "28",            # Slightly lower quality for speed
-                 "-threads", "0",         # Use all available CPU threads
-                 "-an",  # No audio
-                 "-y",
-                 outro_path
-             ]
-             
-             logger.info(f"Creating outro clip: {' '.join(cmd)}")
-             logger.info(f"Outro output path: {outro_path}")
-             logger.info(f"First clip path: {first_clip_path}")
-             logger.info(f"First clip exists: {os.path.exists(first_clip_path)}")
-             
-             result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
-             logger.info(f"Outro clip created successfully: {result.stdout}")
-             
-             # Verify the outro file was created
-             if os.path.exists(outro_path):
-                 outro_size = os.path.getsize(outro_path)
-                 logger.info(f"Outro clip created at {outro_path}, size: {outro_size} bytes")
-             else:
-                 logger.error(f"Outro clip was not created at {outro_path}")
-             
-             return outro_path
-             
-         except Exception as e:
-             logger.error(f"Failed to create outro clip: {e}")
-             # Fallback: return first clip if outro creation fails
-             return first_clip_path
+        """
+        Create a 2-second blurred outro clip from the first video with subscribe message
+        """
+        try:
+            outro_path = os.path.join(settings.TEMP_DIR, "outro.mp4")
+
+            # Get target dimensions based on the selected format
+            format_info = settings.VIDEO_FORMATS[request.format]
+            target_width = format_info["width"]
+            target_height = format_info["height"]
+
+            # Adjust font size based on format (smaller for vertical formats)
+            if request.format == "shorts":
+                font_size = 48  # Smaller font for vertical format
+            else:
+                font_size = 72  # Standard font size for horizontal formats
+
+            # Normalize font path for FFmpeg (use forward slashes)
+            fontfile = os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT).replace('\\', '/')
+
+            # Extract 2 seconds from the beginning of the first clip
+            # Apply heavy blur effect and overlay subscribe message
+            # Use the same formatting logic as the main video
+            subscribe_text = "SUBSCRIBE FOR MORE!"
+
+            if request.format == "shorts":
+                # For YouTube Shorts: Crop from sides, maintain center content
+                filter_complex = (
+                    f"crop=iw*9/16:ih:(iw-iw*9/16)/2:0,"  # Crop to 9:16 ratio, center horizontally
+                    f"scale={target_width}:{target_height},"  # Scale to target dimensions
+                    f"boxblur=20:20,"  # Apply blur effect
+                    f"drawtext=text='{subscribe_text}':fontfile={fontfile}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
+                )
+            elif request.format == "instagram":
+                # For Instagram: Crop to square, center
+                filter_complex = (
+                    f"crop=min(iw,ih):min(iw,ih):(iw-min(iw,ih))/2:(ih-min(iw,ih))/2,"  # Crop to square, center
+                    f"scale={target_width}:{target_height},"  # Scale to target dimensions
+                    f"boxblur=20:20,"  # Apply blur effect
+                    f"drawtext=text='{subscribe_text}':fontfile={fontfile}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
+                )
+            else:
+                # For YouTube: Standard scaling with padding
+                filter_complex = f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,boxblur=20:20,drawtext=text='{subscribe_text}':fontfile={fontfile}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
+
+            cmd = [
+                settings.FFMPEG_PATH,
+                "-i", first_clip_path,
+                "-t", "2",  # 2 seconds duration
+                "-vf", filter_complex,
+                "-c:v", "libx264",
+                "-preset", "ultrafast",  # Fastest encoding for speed
+                "-crf", "28",            # Slightly lower quality for speed
+                "-threads", "0",         # Use all available CPU threads
+                "-an",  # No audio
+                "-y",
+                outro_path
+            ]
+            
+            logger.info(f"Creating outro clip: {' '.join(cmd)}")
+            logger.info(f"Outro output path: {outro_path}")
+            logger.info(f"First clip path: {first_clip_path}")
+            logger.info(f"First clip exists: {os.path.exists(first_clip_path)}")
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
+            logger.info(f"Outro clip created successfully: {result.stdout}")
+            
+            # Verify the outro file was created
+            if os.path.exists(outro_path):
+                outro_size = os.path.getsize(outro_path)
+                logger.info(f"Outro clip created at {outro_path}, size: {outro_size} bytes")
+            else:
+                logger.error(f"Outro clip was not created at {outro_path}")
+            
+            return outro_path
+            
+        except Exception as e:
+            logger.error(f"Failed to create outro clip: {e}")
+            # Fallback: return first clip if outro creation fails
+            return first_clip_path
 
     def _validate_ffmpeg_installation(self):
         """

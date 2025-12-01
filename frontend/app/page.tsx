@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import ClipForm from '../components/ClipForm'
 import ClipList from '../components/ClipList'
 import Settings from '../components/Settings'
@@ -19,6 +19,7 @@ export default function Home() {
     format: 'youtube' as VideoFormat
   })
   const [isProcessing, setIsProcessing] = useState(false)
+  const [backendStatus, setBackendStatus] = useState<'unknown' | 'healthy' | 'unhealthy'>('unknown')
   const [taskId, setTaskId] = useState<string | null>(null)
   const [progress, setProgress] = useState(0)
   const [status, setStatus] = useState('')
@@ -54,7 +55,8 @@ export default function Home() {
         ...settings
       }
 
-      const response = await fetch('/api/generate-video', {
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || ''
+      const response = await fetch(`${baseUrl}/generate-video`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -79,10 +81,36 @@ export default function Home() {
     }
   }
 
+  // Health check for backend service
+  useEffect(() => {
+    const baseUrl = process.env.NEXT_PUBLIC_API_URL || ''
+
+    const checkHealth = async () => {
+      try {
+        const res = await fetch(`${baseUrl}/health`)
+        if (res.ok) {
+          const data = await res.json()
+          if (data.status === 'healthy') setBackendStatus('healthy')
+          else setBackendStatus('unhealthy')
+        } else {
+          setBackendStatus('unhealthy')
+        }
+      } catch (e) {
+        setBackendStatus('unhealthy')
+      }
+    }
+
+    // Initial check
+    checkHealth()
+    const id = setInterval(checkHealth, 5000)
+    return () => clearInterval(id)
+  }, [])
+
   const pollStatus = async (id: string) => {
     const interval = setInterval(async () => {
       try {
-        const response = await fetch(`/api/status/${id}`)
+        const baseUrl = process.env.NEXT_PUBLIC_API_URL || ''
+        const response = await fetch(`${baseUrl}/status/${id}`)
         if (response.ok) {
           const statusData = await response.json()
           
@@ -115,9 +143,17 @@ export default function Home() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center py-6">
             <div>
-              <h1 className="text-3xl font-bold text-gray-900">
-                YouTube Clip Compilation Tool
-              </h1>
+              <div className="flex items-center gap-3">
+                <h1 className="text-3xl font-bold text-gray-900">YouTube Clip Compilation Tool</h1>
+                {/* Backend health indicator */}
+                <div className="flex items-center text-sm text-gray-600">
+                  <span
+                    aria-hidden
+                    className={`inline-block w-3 h-3 rounded-full mr-2 ${backendStatus === 'healthy' ? 'bg-green-500' : backendStatus === 'unhealthy' ? 'bg-red-500' : 'bg-gray-300'}`}
+                  />
+                  <span>{backendStatus === 'healthy' ? 'Backend healthy' : backendStatus === 'unhealthy' ? 'Backend unreachable' : 'Checking backend...'}</span>
+                </div>
+              </div>
               <p className="text-gray-600 mt-1">
                 Create amazing video compilations with AI summaries
               </p>
