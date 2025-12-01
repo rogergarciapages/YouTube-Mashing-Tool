@@ -132,8 +132,8 @@ class VideoProcessor:
             styled_clip = os.path.join(temp_dir, "styled.mp4")
             final_clip = os.path.join(temp_dir, "final.mp4")
             
-            # 1. Download YouTube clip
-            self._download_clip(clip.url, clip.timestamp, raw_clip)
+            # 1. Download YouTube clip - pass download config if provided
+            self._download_clip(clip.url, clip.timestamp, raw_clip, request.download_config)
             
             # 2. Generate AI summary
             summary = self._generate_summary(clip)
@@ -153,9 +153,15 @@ class VideoProcessor:
             logger.error(f"Error processing clip {index}: {e}")
             raise
     
-    def _download_clip(self, url: str, timestamp: int, output_path: str):
+    def _download_clip(self, url: str, timestamp: int, output_path: str, download_config=None):
         """
         Download a 3-second clip from YouTube starting at the specified timestamp
+        
+        Parameters:
+        - url: YouTube video URL
+        - timestamp: start time in seconds
+        - output_path: where to save the downloaded clip
+        - download_config: optional DownloadConfig with cookies_file, use_geo_bypass, retries
         
         Timeout handling:
         - Base timeout: 120 seconds (2 minutes)
@@ -182,6 +188,25 @@ class VideoProcessor:
             "socket_timeout": 15,
             "http_chunk_size": 1048576,
         }
+
+        # Add cookies if provided
+        if download_config and download_config.cookies_file:
+            cookies_path = download_config.cookies_file
+            if os.path.exists(cookies_path):
+                logger.info(f"Using cookies file: {cookies_path}")
+                ydl_opts["cookiefile"] = cookies_path
+            else:
+                logger.warning(f"Cookies file not found: {cookies_path}")
+
+        # Add geo-bypass if enabled
+        if download_config and download_config.use_geo_bypass:
+            ydl_opts["geo_bypass"] = True
+            logger.info("Geo-bypass enabled")
+
+        # Use retries from config if provided
+        if download_config and download_config.retries:
+            ydl_opts["retries"] = download_config.retries
+            logger.info(f"Retries set to: {download_config.retries}")
 
         def _run_ydl_with_opts(opts):
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -270,6 +295,22 @@ class VideoProcessor:
 
         if not actual_temp_file:
             raise Exception(f"Downloaded video file not found. Expected: {temp_video}(.ext), Directory contents: {os.listdir(temp_dir) if os.path.exists(temp_dir) else 'Directory does not exist'}")
+
+        # Check if the downloaded file is actually a video or an error page (.mhtml, .html, etc.)
+        logger.info(f"Checking downloaded file validity: {actual_temp_file}")
+        if actual_temp_file.endswith(('.mhtml', '.html', '.htm', '.txt')):
+            # This is likely an error page from YouTube (age-restricted, region-blocked, or requires login)
+            logger.error(f"Downloaded file appears to be an error page: {actual_temp_file}")
+            # Try to read the file to understand the error
+            try:
+                with open(actual_temp_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read(500)  # Read first 500 chars
+                logger.error(f"File content preview: {content}")
+            except Exception as read_e:
+                logger.error(f"Could not read error file: {read_e}")
+            raise Exception(f"YouTube returned an error page (age-restricted, region-blocked, or requires login). " +
+                          f"The video at {url_str} cannot be accessed directly. " +
+                          f"Please provide cookies via --cookies flag or use a VPN/proxy to bypass restrictions.")
 
         logger.info(f"Processing downloaded video: {actual_temp_file}")
             

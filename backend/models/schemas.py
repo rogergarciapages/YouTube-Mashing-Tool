@@ -24,6 +24,12 @@ class ClipRequest(BaseModel):
             raise ValueError('Timestamp must be non-negative')
         return v
 
+class DownloadConfig(BaseModel):
+    """Configuration for downloading videos (cookies, headers, etc.)"""
+    cookies_file: Optional[str] = None  # Path to cookies.txt file
+    use_geo_bypass: bool = True  # Whether to use geo-bypass
+    retries: int = 3  # Number of retries
+
 class VideoRequest(BaseModel):
     clips: List[ClipRequest]
     title: str = "Amazing Video Compilation"  # Default title for intro
@@ -33,6 +39,7 @@ class VideoRequest(BaseModel):
     placement: TextPlacement = TextPlacement.bottom
     music: Optional[str] = None
     format: VideoFormat = VideoFormat.youtube
+    download_config: Optional[DownloadConfig] = None  # Optional cookies/download settings
     
     @validator('clips')
     def validate_clips(cls, v):
