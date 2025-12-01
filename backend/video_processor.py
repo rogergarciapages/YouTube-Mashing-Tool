@@ -236,135 +236,140 @@ class VideoProcessor:
                 logger.error(f"Fallback yt-dlp download also failed: {e2}")
                 raise
             
-            # Check if the temp file was created with the expected name
-            # yt-dlp might add extensions or modify the filename
-            actual_temp_file = None
-            if os.path.exists(temp_video):
-                actual_temp_file = temp_video
+        # Check if the temp file was created with the expected name
+        # yt-dlp will append the extension (e.g., .mp4) to our template outtmpl
+        actual_temp_file = None
+
+        # Try common extensions first
+        for ext in ('.mp4', '.webm', '.mkv', '.m4v'):
+            candidate = temp_video + ext
+            if os.path.exists(candidate):
+                actual_temp_file = candidate
                 logger.info(f"Using expected temp file: {actual_temp_file}")
-            else:
-                # Look for the actual downloaded file
-                logger.info(f"Expected temp file not found: {temp_video}")
-                logger.info(f"Searching in directory: {temp_dir}")
-                logger.info(f"Directory contents: {os.listdir(temp_dir) if os.path.exists(temp_dir) else 'Directory does not exist'}")
-                
-                for filename in os.listdir(temp_dir):
-                    if filename.startswith("temp_") and filename.endswith(('.mp4', '.webm', '.mkv')):
-                        actual_temp_file = os.path.join(temp_dir, filename)
-                        logger.info(f"Found downloaded file: {actual_temp_file}")
-                        break
-                
-                # If still not found, try to find any video file
-                if not actual_temp_file:
-                    for filename in os.listdir(temp_dir):
-                        if filename.endswith(('.mp4', '.webm', '.mkv')):
-                            actual_temp_file = os.path.join(temp_dir, filename)
-                            logger.info(f"Found alternative video file: {actual_temp_file}")
-                            break
-            
+                break
+
+        if not actual_temp_file:
+            # Look for the actual downloaded file by prefix
+            logger.info(f"Expected temp file not found (checked extensions): {temp_video}")
+            logger.info(f"Searching in directory: {temp_dir}")
+            logger.info(f"Directory contents: {os.listdir(temp_dir) if os.path.exists(temp_dir) else 'Directory does not exist'}")
+
+            for filename in os.listdir(temp_dir):
+                if filename.startswith("temp_") and filename.endswith(('.mp4', '.webm', '.mkv', '.m4v')):
+                    actual_temp_file = os.path.join(temp_dir, filename)
+                    logger.info(f"Found downloaded file: {actual_temp_file}")
+                    break
+
+            # If still not found, try to find any video file
             if not actual_temp_file:
-                raise Exception(f"Downloaded video file not found. Expected: {temp_video}, Directory contents: {os.listdir(temp_dir) if os.path.exists(temp_dir) else 'Directory does not exist'}")
+                for filename in os.listdir(temp_dir):
+                    if filename.endswith(('.mp4', '.webm', '.mkv', '.m4v')):
+                        actual_temp_file = os.path.join(temp_dir, filename)
+                        logger.info(f"Found alternative video file: {actual_temp_file}")
+                        break
+
+        if not actual_temp_file:
+            raise Exception(f"Downloaded video file not found. Expected: {temp_video}(.ext), Directory contents: {os.listdir(temp_dir) if os.path.exists(temp_dir) else 'Directory does not exist'}")
+
+        logger.info(f"Processing downloaded video: {actual_temp_file}")
             
-            logger.info(f"Processing downloaded video: {actual_temp_file}")
-            
-            # Now extract the exact 3-second segment using FFmpeg
-            # Use faster settings for quicker processing
-            # MUTE the audio completely
-            cmd = [
-                settings.FFMPEG_PATH,
-                "-i", actual_temp_file,
-                "-ss", str(timestamp),  # Start at timestamp
-                "-t", str(settings.CLIP_DURATION),  # Duration of 3 seconds
-                "-c:v", "libx264",  # Re-encode video for timestamp accuracy
-                "-an",               # Remove audio completely (mute)
-                "-preset", "ultrafast",  # Fastest encoding for speed
-                "-crf", "28",        # Slightly lower quality for speed
-                "-avoid_negative_ts", "make_zero",  # Reset timestamps
-                "-vsync", "cfr",     # Constant frame rate
-                "-threads", "0",     # Use all available CPU threads
-                "-y",  # Overwrite output
-                output_path
-            ]
-            
-            # Log the full FFmpeg command for debugging
-            logger.info(f"FFmpeg command: {' '.join(cmd)}")
-            logger.info(f"Input file exists: {os.path.exists(actual_temp_file)}")
-            logger.info(f"Input file size: {os.path.getsize(actual_temp_file) if os.path.exists(actual_temp_file) else 'N/A'} bytes")
-            logger.info(f"Output directory exists: {os.path.exists(os.path.dirname(output_path))}")
-            
+        # Now extract the exact 3-second segment using FFmpeg
+        # Use faster settings for quicker processing
+        # MUTE the audio completely
+        cmd = [
+            settings.FFMPEG_PATH,
+            "-i", actual_temp_file,
+            "-ss", str(timestamp),  # Start at timestamp
+            "-t", str(settings.CLIP_DURATION),  # Duration of 3 seconds
+            "-c:v", "libx264",  # Re-encode video for timestamp accuracy
+            "-an",               # Remove audio completely (mute)
+            "-preset", "ultrafast",  # Fastest encoding for speed
+            "-crf", "28",        # Slightly lower quality for speed
+            "-avoid_negative_ts", "make_zero",  # Reset timestamps
+            "-vsync", "cfr",     # Constant frame rate
+            "-threads", "0",     # Use all available CPU threads
+            "-y",  # Overwrite output
+            output_path
+        ]
+
+        # Log the full FFmpeg command for debugging
+        logger.info(f"FFmpeg command: {' '.join(cmd)}")
+        logger.info(f"Input file exists: {os.path.exists(actual_temp_file)}")
+        logger.info(f"Input file size: {os.path.getsize(actual_temp_file) if os.path.exists(actual_temp_file) else 'N/A'} bytes")
+        logger.info(f"Output directory exists: {os.path.exists(os.path.dirname(output_path))}")
+
+        try:
+            # Verify all paths before running FFmpeg
+            if not os.path.exists(actual_temp_file):
+                raise Exception(f"Input file does not exist: {actual_temp_file}")
+
+            output_dir = os.path.dirname(output_path)
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
+                logger.info(f"Created output directory: {output_dir}")
+
+            # Check if FFmpeg executable exists
+            logger.info(f"FFmpeg path from settings: {settings.FFMPEG_PATH}")
+            if not os.path.exists(settings.FFMPEG_PATH):
+                raise Exception(f"FFmpeg executable not found at: {settings.FFMPEG_PATH}")
+
+            logger.info(f"FFmpeg executable verified, size: {os.path.getsize(settings.FFMPEG_PATH)} bytes")
+
+            # Test if FFmpeg can run at all
             try:
-                # Verify all paths before running FFmpeg
-                if not os.path.exists(actual_temp_file):
-                    raise Exception(f"Input file does not exist: {actual_temp_file}")
-                
-                output_dir = os.path.dirname(output_path)
-                if not os.path.exists(output_dir):
-                    os.makedirs(output_dir, exist_ok=True)
-                    logger.info(f"Created output directory: {output_dir}")
-                
-                # Check if FFmpeg executable exists
-                logger.info(f"FFmpeg path from settings: {settings.FFMPEG_PATH}")
-                if not os.path.exists(settings.FFMPEG_PATH):
-                    raise Exception(f"FFmpeg executable not found at: {settings.FFMPEG_PATH}")
-                
-                logger.info(f"FFmpeg executable verified, size: {os.path.getsize(settings.FFMPEG_PATH)} bytes")
-                
-                # Test if FFmpeg can run at all
-                try:
-                    test_result = subprocess.run([settings.FFMPEG_PATH, "-version"], 
-                                              capture_output=True, text=True, timeout=10)
-                    logger.info(f"FFmpeg version test successful: {test_result.stdout[:100]}...")
-                except Exception as test_e:
-                    logger.error(f"FFmpeg version test failed: {test_e}")
-                    raise Exception(f"FFmpeg is not working: {test_e}")
-                
-                logger.info(f"Running FFmpeg command...")
-                # Increase timeout for large files - base timeout + additional time per MB
-                file_size_mb = os.path.getsize(actual_temp_file) / (1024 * 1024)
-                timeout_seconds = max(120, int(file_size_mb * 3))  # At least 120s, plus 3s per MB for safety
-                logger.info(f"File size: {file_size_mb:.1f}MB, using timeout: {timeout_seconds}s")
-                logger.info(f"Processing large file - this may take several minutes...")
-                logger.info(f"FFmpeg processing started at: {time.strftime('%H:%M:%S')}")
-                
-                # For large files, provide more frequent progress updates
-                if file_size_mb > 100:  # Very large files
-                    logger.info(f"Large file detected ({file_size_mb:.1f}MB) - processing may take 5-10 minutes")
-                
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout_seconds)
-                logger.info(f"FFmpeg processing completed at: {time.strftime('%H:%M:%S')}")
-                logger.info(f"FFmpeg clip extraction completed: {result.stdout}")
-                
-            except subprocess.TimeoutExpired:
-                logger.error(f"FFmpeg command timed out after {timeout_seconds} seconds")
-                raise Exception(f"FFmpeg command timed out after {timeout_seconds} seconds")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"FFmpeg command failed with return code {e.returncode}")
-                logger.error(f"FFmpeg stderr: {e.stderr}")
-                logger.error(f"FFmpeg stdout: {e.stdout}")
-                raise Exception(f"FFmpeg command failed: {e.stderr}")
-            except FileNotFoundError as e:
-                logger.error(f"File not found error: {e}")
-                raise Exception(f"File not found: {e}")
-            except Exception as e:
-                logger.error(f"Unexpected error during FFmpeg execution: {e}")
-                raise Exception(f"FFmpeg execution error: {e}")
-            
-            # Clean up temporary file
-            if os.path.exists(actual_temp_file):
-                os.remove(actual_temp_file)
-                
+                test_result = subprocess.run([settings.FFMPEG_PATH, "-version"], 
+                                          capture_output=True, text=True, timeout=10)
+                logger.info(f"FFmpeg version test successful: {test_result.stdout[:100]}...")
+            except Exception as test_e:
+                logger.error(f"FFmpeg version test failed: {test_e}")
+                raise Exception(f"FFmpeg is not working: {test_e}")
+
+            logger.info(f"Running FFmpeg command...")
+            # Increase timeout for large files - base timeout + additional time per MB
+            file_size_mb = os.path.getsize(actual_temp_file) / (1024 * 1024)
+            timeout_seconds = max(120, int(file_size_mb * 3))  # At least 120s, plus 3s per MB for safety
+            logger.info(f"File size: {file_size_mb:.1f}MB, using timeout: {timeout_seconds}s")
+            logger.info(f"Processing large file - this may take several minutes...")
+            logger.info(f"FFmpeg processing started at: {time.strftime('%H:%M:%S')}")
+
+            # For large files, provide more frequent progress updates
+            if file_size_mb > 100:  # Very large files
+                logger.info(f"Large file detected ({file_size_mb:.1f}MB) - processing may take 5-10 minutes")
+
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout_seconds)
+            logger.info(f"FFmpeg processing completed at: {time.strftime('%H:%M:%S')}")
+            logger.info(f"FFmpeg clip extraction completed: {result.stdout}")
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"FFmpeg command timed out after {timeout_seconds} seconds")
+            raise Exception(f"FFmpeg command timed out after {timeout_seconds} seconds")
         except subprocess.CalledProcessError as e:
-            logger.error(f"FFmpeg clip extraction failed: {e.stderr}")
+            logger.error(f"FFmpeg command failed with return code {e.returncode}")
+            logger.error(f"FFmpeg stderr: {e.stderr}")
+            logger.error(f"FFmpeg stdout: {e.stdout}")
             # Clean up on error
-            if os.path.exists(temp_video):
-                os.remove(temp_video)
-            raise Exception(f"Failed to extract video clip: {e.stderr}")
+            if os.path.exists(actual_temp_file):
+                try:
+                    os.remove(actual_temp_file)
+                except Exception:
+                    pass
+            raise Exception(f"FFmpeg command failed: {e.stderr}")
+        except FileNotFoundError as e:
+            logger.error(f"File not found error: {e}")
+            raise Exception(f"File not found: {e}")
         except Exception as e:
-            logger.error(f"Error downloading video from {url_str}: {e}")
+            logger.error(f"Unexpected error during FFmpeg execution: {e}")
             # Clean up on error
-            if os.path.exists(temp_video):
-                os.remove(temp_video)
-            raise Exception(f"Failed to download video: {str(e)}")
+            if os.path.exists(actual_temp_file):
+                try:
+                    os.remove(actual_temp_file)
+                except Exception:
+                    pass
+            raise Exception(f"FFmpeg execution error: {e}")
+
+        # Clean up temporary file
+        if os.path.exists(actual_temp_file):
+            os.remove(actual_temp_file)
     
     def _generate_summary(self, clip: ClipRequest) -> str:
         """
