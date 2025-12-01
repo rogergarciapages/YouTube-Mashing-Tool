@@ -26,6 +26,7 @@ class ClipRequest(BaseModel):
 
 class VideoRequest(BaseModel):
     clips: List[ClipRequest]
+    title: str = "Amazing Video Compilation"  # Default title for intro
     font: str = "Arial"
     font_size: int = 36
     font_color: str = "white"

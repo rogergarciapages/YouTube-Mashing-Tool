@@ -36,6 +36,17 @@ app.mount("/videos", StaticFiles(directory="videos"), name="videos")
 # Global processor instance
 video_processor = VideoProcessor()
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    """
+    Save all tasks to disk before shutting down
+    """
+    try:
+        video_processor._save_tasks_to_disk()
+        logger.info("All tasks saved to disk before shutdown")
+    except Exception as e:
+        logger.error(f"Error saving tasks during shutdown: {e}")
+
 @app.get("/")
 async def root():
     return {"message": "YouTube Clip Compilation Tool API"}
@@ -99,6 +110,68 @@ async def download_video(filename: str):
         filename=filename,
         media_type="video/mp4"
     )
+
+@app.post("/recover-tasks")
+async def recover_tasks():
+    """
+    Recover tasks from disk and check for completed videos
+    """
+    try:
+        # Reload tasks from disk
+        video_processor._load_tasks_from_disk()
+        
+        # Check for completed videos in output directory
+        output_dir = "videos/output"
+        if os.path.exists(output_dir):
+            for filename in os.listdir(output_dir):
+                if filename.startswith("compilation_") and filename.endswith(".mp4"):
+                    task_id = filename.replace("compilation_", "").replace(".mp4", "")
+                    
+                    # If task exists but doesn't have download_url, update it
+                    if task_id in video_processor.tasks:
+                        task = video_processor.tasks[task_id]
+                        if not task.download_url and task.status == "completed":
+                            task.download_url = f"/download/{filename}"
+                            logger.info(f"Recovered download URL for task {task_id}")
+        
+        # Save updated tasks
+        video_processor._save_tasks_to_disk()
+        
+        recovered_count = len(video_processor.tasks)
+        return {"message": f"Recovered {recovered_count} tasks", "tasks": list(video_processor.tasks.keys())}
+        
+    except Exception as e:
+        logger.error(f"Error recovering tasks: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/retry-task/{task_id}")
+async def retry_task(task_id: str):
+    """
+    Retry a failed task by resetting its status
+    """
+    try:
+        if task_id in video_processor.tasks:
+            task = video_processor.tasks[task_id]
+            if task.status == "error":
+                # Reset task to processing status
+                task.status = "processing"
+                task.progress = 0
+                task.message = "Retrying video processing..."
+                task.error = None
+                
+                # Save updated task
+                video_processor._save_tasks_to_disk()
+                
+                logger.info(f"Reset task {task_id} for retry")
+                return {"message": f"Task {task_id} reset for retry", "status": "processing"}
+            else:
+                raise HTTPException(status_code=400, detail="Task is not in error status")
+        else:
+            raise HTTPException(status_code=404, detail="Task not found")
+            
+    except Exception as e:
+        logger.error(f"Error retrying task {task_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

@@ -7,6 +7,7 @@ export interface ClipRequest {
 
 export interface VideoRequest {
   clips: ClipRequest[]
+  title: string
   font: string
   font_size: number
   font_color: string
@@ -35,6 +36,7 @@ export type VideoFormat = 'youtube' | 'shorts' | 'instagram'
 export type TextPlacement = 'top' | 'center' | 'bottom'
 
 export interface Settings {
+  title: string
   font: string
   font_size: number
   font_color: string

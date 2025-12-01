@@ -10,6 +10,7 @@ import { ClipRequest, VideoRequest, VideoFormat, TextPlacement } from '../types'
 export default function Home() {
   const [clips, setClips] = useState<ClipRequest[]>([])
   const [settings, setSettings] = useState({
+    title: 'Amazing Video Compilation',
     font: 'KOMIKAX_.ttf',
     font_size: 36,
     font_color: 'white',

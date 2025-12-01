@@ -66,6 +66,30 @@ export default function Settings({ settings, onSettingsChange }: SettingsProps) 
       </div>
 
       <div className="space-y-4">
+        {/* Title Settings */}
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            <Type className="w-4 h-4 inline mr-2" />
+            Video Title
+          </label>
+          
+          <div className="text-xs text-gray-500 mb-2">
+            This title will appear in the intro sequence
+          </div>
+          
+          <input
+            type="text"
+            value={settings.title}
+            onChange={(e) => handleChange('title', e.target.value)}
+            placeholder="Enter video title..."
+            className="input-field text-sm"
+          />
+          
+          <div className="text-xs text-gray-500 mt-1">
+            Used for the intro overlay and video identification
+          </div>
+        </div>
+
         {/* Font Settings */}
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-2">
