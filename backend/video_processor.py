@@ -1344,6 +1344,9 @@ class VideoProcessor:
                  font_size = 48  # Smaller font for vertical format
              else:
                  font_size = 72  # Standard font size for horizontal formats
+            
+            # Normalize font path for FFmpeg (use forward slashes)
+            fontfile = os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT).replace('\\', '/')
              
              # Extract 2 seconds from the beginning of the first clip
              # Apply heavy blur effect and overlay title text
@@ -1354,7 +1357,7 @@ class VideoProcessor:
                      f"crop=iw*9/16:ih:(iw-iw*9/16)/2:0,"  # Crop to 9:16 ratio, center horizontally
                      f"scale={target_width}:{target_height},"  # Scale to target dimensions
                      f"boxblur=20:20,"  # Apply blur effect
-                     f"drawtext=text='{request.title}':fontfile={os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT).replace('\\', '/')}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
+                     f"drawtext=text='{request.title}':fontfile={fontfile}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
                  )
              elif request.format == "instagram":
                  # For Instagram: Crop to square, center
@@ -1362,11 +1365,11 @@ class VideoProcessor:
                      f"crop=min(iw,ih):min(iw,ih):(iw-min(iw,ih))/2:(ih-min(iw,ih))/2,"  # Crop to square, center
                      f"scale={target_width}:{target_height},"  # Scale to target dimensions
                      f"boxblur=20:20,"  # Apply blur effect
-                     f"drawtext=text='{request.title}':fontfile={os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT).replace('\\', '/')}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
+                     f"drawtext=text='{request.title}':fontfile={fontfile}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
                  )
              else:
                  # For YouTube: Standard scaling with padding
-                 filter_complex = f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,boxblur=20:20,drawtext=text='{request.title}':fontfile={os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT).replace('\\', '/')}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
+                 filter_complex = f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,boxblur=20:20,drawtext=text='{request.title}':fontfile={fontfile}:fontcolor=white:fontsize={font_size}:x=w*0.075:y=h*0.4-text_h/2:borderw=6:bordercolor=black"
              
              cmd = [
                  settings.FFMPEG_PATH,
