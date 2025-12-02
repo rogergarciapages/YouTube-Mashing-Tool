@@ -102,21 +102,17 @@ class VideoProcessor:
                     return
             
             # Update progress
-            self._update_task_status(task_id, "processing", 80, "Stitching intro, clips, and outro together...")
+            self._update_task_status(task_id, "processing", 80, "Stitching clips and outro together...")
             
-            # Create intro and outro clips
-            self._update_task_status(task_id, "processing", 75, "Creating intro sequence...")
-            intro_clip = self._create_intro_clip(processed_clips[0], request)
-            
+            # Skip intro - start directly with first content clip
             self._update_task_status(task_id, "processing", 77, "Creating outro sequence...")
             outro_clip = self._create_outro_clip(processed_clips[0], request)
             
-            # Combine intro + clips + outro
-            all_clips = [intro_clip] + processed_clips + [outro_clip]
+            # Combine clips + outro (no intro)
+            all_clips = processed_clips + [outro_clip]
             
             # Debug logging for clip combination
-            logger.info(f"Combining clips for stitching:")
-            logger.info(f"Intro clip: {intro_clip} (exists: {os.path.exists(intro_clip)})")
+            logger.info(f"Combining clips for stitching (intro skipped):")
             for i, clip in enumerate(processed_clips):
                 logger.info(f"Content clip {i}: {clip} (exists: {os.path.exists(clip)})")
             logger.info(f"Outro clip: {outro_clip} (exists: {os.path.exists(outro_clip)})")
@@ -191,244 +187,57 @@ class VideoProcessor:
         """
         Download a 3-second clip from YouTube starting at the specified timestamp
         
-        Uses subprocess to invoke yt-dlp CLI directly, which bypasses Python SSL verification issues.
+        Uses multiple download strategies to bypass blocking:
+        1. yt-dlp standard
+        2. yt-dlp with geo-bypass + scraping extractors
+        3. pytube library
+        4. External download API fallback
         
         Parameters:
         - url: YouTube video URL
         - timestamp: start time in seconds
         - output_path: where to save the downloaded clip
         - download_config: optional DownloadConfig with cookies_file, use_geo_bypass, retries
-        
-        Timeout handling:
-        - Base timeout: 120 seconds (2 minutes)
-        - Additional time: 3 seconds per MB of video file
         """
-        # Convert HttpUrl to string if needed
-        url_str = str(url)
+        from utils.download_strategies import download_with_fallbacks
         
-        # Create a unique temp filename to avoid conflicts
+        url_str = str(url)
         temp_dir = os.path.dirname(output_path)
         temp_video = os.path.join(temp_dir, f"temp_{os.path.basename(output_path)}")
         
         logger.info(f"Downloading clip from: {url_str} at timestamp {timestamp}s")
         
-        # Prepare environment with SSL bypass - CRITICAL for Windows Python
-        env = os.environ.copy()
-        ca_bundle = None
-        
-        # Try to use certifi CA bundle
+        # Try to download the full video using fallback strategies
         try:
-            import certifi
-            ca_bundle = certifi.where()
-            env['SSL_CERT_FILE'] = ca_bundle
-            env['SSL_CERT_DIR'] = os.path.dirname(ca_bundle)
-            # Also try the requests-specific paths
-            env['REQUESTS_CA_BUNDLE'] = ca_bundle
-            # Force Python to use certifi
-            env['PYTHONHTTPSVERIFY'] = '1'  # Enable verification with certifi
-            logger.info(f"Using certifi CA bundle: {ca_bundle}")
-        except Exception as certifi_error:
-            logger.warning(f"Could not use certifi: {certifi_error}")
-            # Fallback: disable verification entirely
-            env['PYTHONHTTPSVERIFY'] = '0'
-        
-        # Set CURL to use certifi too
-        env['CURL_CA_BUNDLE'] = env.get('SSL_CERT_FILE', '')
-        env['GIT_SSL_CAINFO'] = env.get('SSL_CERT_FILE', '')
-        
-        try:
-            # First attempt: default options
-            # Use the current Python interpreter with SSL patching
-            import sys
-            cmd = [
-                sys.executable, "-c",
-                "import ssl, sys; "
-                "ssl._create_default_https_context = ssl._create_unverified_context; "
-                "import yt_dlp; "
-                "yt_dlp.main(sys.argv[1:])",
-                "--no-warnings",
-                "--no-color",
-                "-f", "bestvideo[height>=720][ext=mp4]/bestvideo[height>=720]/best[height>=720]/best[ext=mp4]/best",
-                "-o", temp_video + ".%(ext)s",
-                "--retries", str(download_config.retries if download_config and download_config.retries else 3),
-                "--socket-timeout", "30",
-                "--http-chunk-size", "1048576",
-                "--skip-unavailable-fragments",
-                "--no-check-certificates",
-                "--add-header", f"User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-                "--add-header", f"Referer:{url_str}",
-                url_str,
-            ]
+            if not download_with_fallbacks(url_str, temp_video + ".mp4", timeout_base=180):
+                raise Exception("All download strategies failed - video may be DRM-protected, geo-blocked, or age-restricted. Try uploading browser cookies.")
+        except Exception as download_error:
+            logger.error(f"Download failed: {download_error}")
+            raise Exception(f"yt-dlp download failed: {str(download_error)}")
             
-            # Add cookies file if provided
-            if download_config and download_config.cookies_file and os.path.exists(download_config.cookies_file):
-                cmd.insert(-1, "--cookies")
-                cmd.insert(-1, download_config.cookies_file)
-                logger.info(f"Using cookies file: {download_config.cookies_file}")
-            
-            logger.info(f"yt-dlp download with SSL patching via {sys.executable}")
-            # Debug: log SSL-related env vars passed to subprocess
-            logger.info(f"Subprocess env SSL_CERT_FILE={env.get('SSL_CERT_FILE')} REQUESTS_CA_BUNDLE={env.get('REQUESTS_CA_BUNDLE')} PYTHONHTTPSVERIFY={env.get('PYTHONHTTPSVERIFY')}")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env, check=True)
-            logger.info(f"yt-dlp download successful: {result.stdout}")
-            
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"Initial yt-dlp download attempt failed: {e.stderr}")
-            
-            # If it's a 403 or SSL error, attempt fallback with more aggressive settings
-            try:
-                logger.info("Attempting yt-dlp download with fallback: lower quality + more retries + SSL patching")
-                logger.info(f"Subprocess env SSL_CERT_FILE={env.get('SSL_CERT_FILE')} REQUESTS_CA_BUNDLE={env.get('REQUESTS_CA_BUNDLE')} PYTHONHTTPSVERIFY={env.get('PYTHONHTTPSVERIFY')}")
-                cmd = [
-                    sys.executable, "-c",
-                    "import ssl, sys; "
-                    "ssl._create_default_https_context = ssl._create_unverified_context; "
-                    "import yt_dlp; "
-                    "yt_dlp.main(sys.argv[1:])",
-                    "--no-warnings",
-                    "--no-color",
-                    "-f", "best[height<=480]/best",
-                    "-o", temp_video + ".%(ext)s",
-                    "--retries", "10",
-                    "--socket-timeout", "60",
-                    "--http-chunk-size", "1048576",
-                    "--skip-unavailable-fragments",
-                    "--no-check-certificates",
-                    "--geo-bypass",
-                    "--geo-bypass-country", "US",
-                    "--fragment-retries", "10",
-                    "--add-header", f"User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-                    "--add-header", f"Referer:{url_str}",
-                    url_str,
-                ]
-                
-                # Add cookies file if provided
-                if download_config and download_config.cookies_file and os.path.exists(download_config.cookies_file):
-                    cmd.insert(-1, "--cookies")
-                    cmd.insert(-1, download_config.cookies_file)
-                    logger.info(f"Using cookies file in fallback: {download_config.cookies_file}")
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env, check=True)
-                logger.info(f"yt-dlp fallback download successful: {result.stdout}")
-                
-            except subprocess.CalledProcessError as e2:
-                logger.error(f"Final yt-dlp download failed: {e2.stderr}")
-
-                # If the failure is an SSL certificate verification error, attempt a last-ditch run
-                stderr_lower = (e2.stderr or "").lower()
-                if "certificate verify failed" in stderr_lower or "certificateverificationerror" in stderr_lower or "certificat" in stderr_lower:
-                    logger.warning("Detected SSL certificate verification failure; attempting unverified subprocess run with PYTHONHTTPSVERIFY=0")
-                    try:
-                        env_unverified = env.copy()
-                        env_unverified['PYTHONHTTPSVERIFY'] = '0'
-                        env_unverified['REQUESTS_CA_BUNDLE'] = ''
-                        env_unverified['SSL_CERT_FILE'] = ''
-                        env_unverified['CURL_CA_BUNDLE'] = ''
-
-                        # Use -m yt_dlp to avoid -c quoting issues and run module directly
-                        cmd2 = [
-                            sys.executable, "-m", "yt_dlp",
-                            "--no-warnings",
-                            "--no-color",
-                            "-f", "best[height<=480]/best",
-                            "-o", temp_video + ".%(ext)s",
-                            "--retries", "1",
-                            "--socket-timeout", "60",
-                            "--http-chunk-size", "1048576",
-                            "--skip-unavailable-fragments",
-                            "--no-check-certificates",
-                            "--geo-bypass",
-                            "--add-header", f"User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-                            "--add-header", f"Referer:{url_str}",
-                            url_str,
-                        ]
-                        
-                        # Add cookies file if provided
-                        if download_config and download_config.cookies_file and os.path.exists(download_config.cookies_file):
-                            cmd2.insert(-1, "--cookies")
-                            cmd2.insert(-1, download_config.cookies_file)
-                            logger.info(f"Using cookies file in unverified run: {download_config.cookies_file}")
-                            
-                        logger.info(f"Attempting unverified yt-dlp run via: {sys.executable} -m yt_dlp")
-                        result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=300, env=env_unverified, check=True)
-                        logger.info(f"yt-dlp unverified run successful: {result2.stdout}")
-                    except subprocess.CalledProcessError as e3:
-                        logger.error(f"Unverified yt-dlp run also failed: {e3.stderr}")
-                        raise Exception(
-                            f"yt-dlp download failed: {e3.stderr}\n" \
-                            "Hint: Try uploading cookies from your browser (if video is age-restricted/region-locked) or install certifi-win32 to fix SSL verification."
-                        )
-                    except Exception as ex:
-                        logger.error(f"Unexpected error during unverified yt-dlp attempt: {ex}")
-                        raise Exception(
-                            f"yt-dlp download failed after SSL fallback: {ex}\n"
-                            "Hint: Try uploading cookies from your browser (if video is age-restricted/region-locked) or install certifi-win32."
-                        )
-                else:
-                    raise Exception(f"yt-dlp download failed: {e2.stderr}")
-            
-        # Check if the temp file was created with the expected name
-        # yt-dlp will append the extension (e.g., .mp4) to our template outtmpl
-        actual_temp_file = None
+        # The download_with_fallbacks function downloads to temp_video + ".mp4"
+        actual_temp_file = temp_video + ".mp4"
         
-        # Find the downloaded file - yt-dlp appends the extension to outtmpl
-        actual_temp_file = None
-        logger.info(f"Searching for downloaded file in: {temp_dir}")
-        
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir, exist_ok=True)
-        
-        # List directory contents
-        dir_contents = os.listdir(temp_dir)
-        logger.info(f"Directory contents: {dir_contents}")
-        
-        # Try common video extensions first
-        for ext in ('.mp4', '.webm', '.mkv', '.m4v', '.flv', '.3gp'):
-            candidate = temp_video + ext
-            if os.path.exists(candidate):
-                actual_temp_file = candidate
-                logger.info(f"Found temp file: {actual_temp_file}")
-                break
-        
-        # If no video found, check for error pages (.mhtml, .html, etc.) - these indicate access issues
-        if not actual_temp_file:
-            error_extensions = ('.mhtml', '.html', '.htm')
-            for filename in dir_contents:
-                if filename.startswith("temp_") and any(filename.endswith(ext) for ext in error_extensions):
-                    error_file = os.path.join(temp_dir, filename)
-                    logger.error(f"Downloaded file is an error page: {error_file}")
-                    raise Exception(f"YouTube blocked the download (age-restricted, region-blocked, or requires login). " +
-                                  f"The video at {url_str} cannot be accessed. " +
-                                  f"Try using cookies exported from your browser, or use a VPN to bypass restrictions.")
-        
-        # If still not found, search for any file starting with temp_
-        if not actual_temp_file:
-            for filename in dir_contents:
-                if filename.startswith("temp_") and any(filename.endswith(ext) for ext in ('.mp4', '.webm', '.mkv', '.m4v', '.flv', '.3gp')):
-                    actual_temp_file = os.path.join(temp_dir, filename)
-                    logger.info(f"Found temp file: {actual_temp_file}")
-                    break
-
-        if not actual_temp_file:
-            raise Exception(f"Downloaded video file not found. Expected: {temp_video}(.ext), Directory contents: {dir_contents}")
+        if not os.path.exists(actual_temp_file):
+            raise Exception(f"Downloaded video file not found at: {actual_temp_file}")
 
         logger.info(f"Processing downloaded video: {actual_temp_file}")
             
         # Now extract the exact 3-second segment using FFmpeg
-        # Use faster settings for quicker processing
+        # Use re-encoding with libx264 to ensure proper metadata (duration detection)
+        # Seek before input for speed, then encode to guarantee valid stream headers
         # MUTE the audio completely
         cmd = [
             settings.FFMPEG_PATH,
+            "-fflags", "+discardcorrupt",  # Handle corrupt frames from seeking
             "-i", actual_temp_file,
-            "-ss", str(timestamp),  # Start at timestamp
+            "-ss", str(timestamp),  # Start at timestamp (seek happens before encoding)
             "-t", str(settings.CLIP_DURATION),  # Duration of 3 seconds
-            "-c:v", "libx264",  # Re-encode video for timestamp accuracy
-            "-an",               # Remove audio completely (mute)
-            "-preset", "ultrafast",  # Fastest encoding for speed
-            "-crf", "28",        # Slightly lower quality for speed
-            "-avoid_negative_ts", "make_zero",  # Reset timestamps
-            "-vsync", "cfr",     # Constant frame rate
-            "-threads", "0",     # Use all available CPU threads
-            "-y",  # Overwrite output
+            "-c:v", "libx264",       # Re-encode with h264 for valid stream metadata
+            "-preset", "ultrafast",  # Fastest encoding (minimal quality loss from YouTube)
+            "-crf", "23",            # Quality 0-51 (23 is default, barely visible loss)
+            "-an",                   # Remove audio completely (mute)
+            "-y",                    # Overwrite output
             output_path
         ]
 
@@ -729,7 +538,7 @@ class VideoProcessor:
         Format video to target dimensions with proper aspect ratio handling
         
         Cropping Strategy:
-        - YouTube Shorts (9:16): Crop width from sides, maintain height, then scale
+        - YouTube Shorts (9:16): Crop width from sides, maintain height, center content
         - Instagram (1:1): Crop to square, center content, then scale  
         - YouTube (16:9): Scale with padding to maintain aspect ratio
         
@@ -739,107 +548,100 @@ class VideoProcessor:
         target_width = format_info["width"]
         target_height = format_info["height"]
         
-        # Log the formatting operation
         logger.info(f"Formatting video to {target_width}x{target_height} ({format_type})")
         
-        # First, check if the input video is already in the target format
+        # Get input video dimensions using FFprobe with a simpler, more reliable approach
+        input_width = None
+        input_height = None
+        
         try:
-            # Get video dimensions using FFprobe
-            probe_cmd = [
-                settings.FFMPEG_PATH.replace("ffmpeg", "ffprobe"),
-                "-v", "quiet",
-                "-print_format", "json",
-                "-show_streams",
-                "-select_streams", "v:0",
-                input_path
-            ]
+            import json
+            ffprobe_path = settings.FFMPEG_PATH.replace("ffmpeg.exe", "ffprobe.exe")
             
-            # Try to use ffprobe, fallback to ffmpeg if not available
-            if not os.path.exists(probe_cmd[0]):
-                probe_cmd[0] = settings.FFMPEG_PATH
-                probe_cmd[1:3] = ["-i", input_path]
-                probe_cmd[3:] = ["-f", "null", "-"]
-            
-            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
-            
-            if probe_result.returncode == 0:
-                # Parse video dimensions from ffprobe output
-                if "ffprobe" in probe_cmd[0]:
+            if os.path.exists(ffprobe_path):
+                probe_cmd = [
+                    ffprobe_path,
+                    "-v", "quiet",
+                    "-print_format", "json",
+                    "-show_streams",
+                    "-select_streams", "v:0",
+                    input_path
+                ]
+                
+                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+                
+                if probe_result.returncode == 0:
                     try:
-                        import json
                         video_info = json.loads(probe_result.stdout)
                         if 'streams' in video_info and video_info['streams']:
                             stream = video_info['streams'][0]
                             input_width = int(stream.get('width', 0))
                             input_height = int(stream.get('height', 0))
-                            
-                            # Calculate aspect ratios
-                            input_ratio = input_width / input_height if input_height > 0 else 0
-                            target_ratio = target_width / target_height
-                            
-                            logger.info(f"Input video dimensions: {input_width}x{input_height} (ratio: {input_ratio:.3f})")
-                            logger.info(f"Target dimensions: {target_width}x{target_height} (ratio: {target_ratio:.3f})")
-                            
-                            # Check if aspect ratios are close enough (within 0.1 tolerance)
-                            if abs(input_ratio - target_ratio) < 0.1:
-                                logger.info(f"Video is already in target format ({format_type}), skipping formatting")
-                                # Just copy the file to output path
-                                shutil.copy2(input_path, output_path)
-                                return
-                    except (json.JSONDecodeError, KeyError, ValueError) as e:
-                        logger.warning(f"Could not parse video info: {e}, proceeding with formatting")
-                else:
-                    # Fallback: try to extract dimensions from ffmpeg output
-                    lines = probe_result.stderr.split('\n')
-                    for line in lines:
-                        if 'Stream' in line and 'Video' in line:
-                            # Look for dimensions like "1920x1080"
-                            import re
-                            match = re.search(r'(\d+)x(\d+)', line)
-                            if match:
-                                input_width = int(match.group(1))
-                                input_height = int(match.group(2))
-                                input_ratio = input_width / input_height
-                                target_ratio = target_width / target_height
-                                
-                                logger.info(f"Input video dimensions: {input_width}x{input_height} (ratio: {input_ratio:.3f})")
-                                logger.info(f"Target dimensions: {target_width}x{target_height} (ratio: {target_ratio:.3f})")
-                                
-                                if abs(input_ratio - target_ratio) < 0.1:
-                                    logger.info(f"Video is already in target format ({format_type}), skipping formatting")
-                                    shutil.copy2(input_path, output_path)
-                                    return
-                                break
+                            logger.info(f"FFprobe detected: {input_width}x{input_height}")
+                    except Exception as e:
+                        logger.warning(f"Could not parse ffprobe output: {e}")
         except Exception as e:
-            logger.warning(f"Could not check video dimensions: {e}, proceeding with formatting")
+            logger.warning(f"FFprobe not available: {e}")
+        
+        # Fallback: extract dimensions from FFmpeg output
+        if not input_width or not input_height:
+            try:
+                cmd = [settings.FFMPEG_PATH, "-i", input_path]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                
+                # FFmpeg outputs to stderr
+                import re
+                match = re.search(r'(\d+)x(\d+)', result.stderr)
+                if match:
+                    input_width = int(match.group(1))
+                    input_height = int(match.group(2))
+                    logger.info(f"FFmpeg detected: {input_width}x{input_height}")
+            except Exception as e:
+                logger.warning(f"Could not extract dimensions from FFmpeg: {e}")
+        
+        # If we still can't get dimensions, use default 16:9
+        if not input_width or not input_height or input_width == 0 or input_height == 0:
+            logger.warning(f"Could not detect input dimensions, assuming 16:9 (1920x1080)")
+            input_width = 1920
+            input_height = 1080
+        
+        input_ratio = input_width / input_height if input_height > 0 else 1.778
+        target_ratio = target_width / target_height
+        
+        logger.info(f"Input video dimensions: {input_width}x{input_height} (ratio: {input_ratio:.3f})")
+        logger.info(f"Target dimensions: {target_width}x{target_height} (ratio: {target_ratio:.3f})")
+        
+        # Check if aspect ratios are close enough (within 0.1 tolerance)
+        if abs(input_ratio - target_ratio) < 0.1:
+            logger.info(f"Video is already in target format ({format_type}), skipping formatting")
+            shutil.copy2(input_path, output_path)
+            return
         
         # Build FFmpeg command with improved aspect ratio handling
         if format_type == "shorts":
-            # For YouTube Shorts (9:16): Crop from sides, maintain center content
-            # This ensures we crop from the sides instead of squeezing
-            # For 16:9 input (1920x1080) -> crop to 608x1080 (9:16 ratio) -> scale to 1080x1920
-            # For 4:3 input (1440x1080) -> crop to 608x1080 (9:16 ratio) -> scale to 1080x1920
-            # The key is to maintain the original height and crop the width proportionally
-            
-            # Calculate expected crop dimensions for logging
-            # For a 1920x1080 input: crop width = 1920 * 9/16 = 1080, crop height = 1080
-            # This gives us a 1080x1080 crop, which when scaled becomes 1080x1920 (9:16)
+            # For YouTube Shorts (9:16): Crop from sides to create center-focused vertical video
+            # This maintains the center content and crops equally from left and right edges
+            # Formula: crop_width = input_height * (9/16), x_offset = (input_width - crop_width) / 2
             filter_complex = (
-                f"crop=iw*9/16:ih:(iw-iw*9/16)/2:0,"  # Crop to 9:16 ratio, center horizontally
+                f"crop=ih*9/16:ih:(iw-ih*9/16)/2:0,"  # Crop to 9:16 ratio (height * 9/16), center horizontally
                 f"scale={target_width}:{target_height}"  # Scale to target dimensions
             )
-            logger.info(f"Using crop filter for YouTube Shorts: crop=iw*9/16:ih:(iw-iw*9/16)/2:0")
-            logger.info(f"This will crop the width to 9/16 of original while maintaining height")
-            logger.info(f"Example: 1920x1080 -> crop to 1080x1080 -> scale to 1080x1920")
+            logger.info(f"YouTube Shorts (9:16) crop formula: crop=ih*9/16:ih:(iw-ih*9/16)/2:0")
+            logger.info(f"This crops width to (height × 9/16) and centers content horizontally")
+            logger.info(f"Example: 1920x1080 -> crop to 607.5x1080 -> scale to 1080x1920")
+            
         elif format_type == "instagram":
             # For Instagram (1:1): Crop to square, scale to 1080x1080
             filter_complex = (
                 f"crop=min(iw,ih):min(iw,ih):(iw-min(iw,ih))/2:(ih-min(iw,ih))/2,"  # Crop to square, center
                 f"scale={target_width}:{target_height}"  # Scale to target dimensions
             )
+            logger.info(f"Instagram (1:1) crop: center-focused square crop")
+            
         else:
             # For YouTube (16:9): Use standard scaling with padding
             filter_complex = f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black"
+            logger.info(f"YouTube (16:9) format: scale with black padding")
         
         cmd = [
             settings.FFMPEG_PATH,
@@ -855,7 +657,7 @@ class VideoProcessor:
         
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            logger.info(f"Video formatting completed successfully: {result.stdout}")
+            logger.info(f"Video formatting completed successfully")
             
             # Verify the output file
             if os.path.exists(output_path):

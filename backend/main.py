@@ -31,9 +31,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files for video downloads
-app.mount("/videos", StaticFiles(directory="videos"), name="videos")
-
 # Global processor instance
 video_processor = VideoProcessor()
 
