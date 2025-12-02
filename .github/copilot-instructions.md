@@ -88,48 +88,47 @@ Scaling applied in `video_processor.py` before overlay rendering.
 ## Integration Points
 
 ### Google Generative AI (Gemini)
-- Used in `ai_client.py` for 1-sentence clip summaries
-- Graceful degradation: if API key missing or call fails, falls back to keyword extraction
-- Model: `gemini-1.5-flash` (fast, low-cost)
+# Copilot instructions — YTTool (concise)
 
-### yt-dlp Video Download
-- Downloads YouTube clips with specified timestamps
-- `video_processor.py` uses custom format selection for best quality
-- Handles age-restricted/private videos with error logging
+This file gives an AI coding agent the minimum, high‑value knowledge to work productively on YTTool.
 
-### FFmpeg Operations
-- Text overlay: `drawtext` filter
-- Audio mixing: background music mixed with clip audio
-- Format conversion: all clips normalized to target VideoFormat
-- Concatenation: demuxer-based stitching of intro+clips+outro+music
+Key facts (read before editing code)
+- Repo: Next.js frontend (frontend/) + FastAPI backend (backend/). Video work happens server‑side in `backend/video_processor.py`.
+- Long/complex file: `backend/video_processor.py` is the single biggest implementation area — it downloads with yt-dlp, runs FFmpeg filters, and manages tasks.
+- Task flow: frontend -> POST /generate-video -> FastAPI spawns background VideoProcessor.process_video_request(task_id) -> updates stored ProcessingStatus -> frontend polls /status/{task_id}.
+- SSL/cert issue: Windows Python often fails TLS verification for YouTube APIs. Workaround: upload browser cookies (extracts authentication) or install certifi-win32 to use Windows CA store.
 
-## Development Conventions
+Quick start (dev)
+- Backend (Windows PowerShell):
+  & "backend/venv/Scripts/Activate.ps1"; python -m pip install -r backend/requirements.txt; python -m uvicorn main:app --reload
+- Frontend:
+  cd frontend; npm install; npm run dev
 
-**Error Handling:**
-- Backend catches exceptions per-clip; updates task status to "error" with descriptive message
-- Frontend displays error in UI via task status polling
-- Logging: INFO for major operations, DEBUG for detailed processing steps
+Important files/places to change
+- `backend/video_processor.py` — core logic; look for `_download_clip()`, `_overlay_text()`, `_format_video()`, `_stitch_clips()`.
+- `backend/models/schemas.py` — Pydantic types (VideoRequest, ClipRequest, DownloadConfig) and validation rules.
+- `config/settings.py` — FFmpeg path, temp/output dirs, CLIP_DURATION, CLEANUP_TEMP_FILES. Change runtime defaults here.
+- `utils/ai_client.py` — Google Generative AI integration; has graceful fallback to keyword summaries.
+- `frontend/components/CookiesUpload.tsx` — cookies file upload UI; sends POST /upload-cookies to backend and stores path in download_config.
 
-**API Response Format:**
-```python
-# VideoResponse (initial submission)
-{"task_id": "uuid", "status": "processing"}
+Patterns & gotchas (project‑specific)
+- Task persistence: tasks stored in memory and saved to disk (see _load_tasks_from_disk/_save_tasks_to_disk). When changing status format, migrate both code paths.
+- FFmpeg: Commands are built manually (drawtext filters, cropping); test locally with the exact ffmpeg command logged in the backend logs.
+- yt-dlp SSL on Windows: `_download_clip()` now supports cookies file (--cookies flag). If cookies not available, tries unverified SSL fallback. Both methods use subprocess with ssl._create_unverified_context.
+- Cookies workflow: frontend uploads file via POST /upload-cookies -> saved to `videos/temp/cookies/` -> path returned in JSON -> frontend includes path in download_config.cookies_file -> backend passes to yt-dlp.
+- Large file timeouts: FFmpeg timeouts scale with input size (file_size_mb * 3s). Increase if you change encoding steps.
 
-# ProcessingStatus (polling)
-{"task_id": "uuid", "status": "processing|completed|error", 
- "progress": 0-100, "message": "Human-readable status"}
-```
+Debugging tips
+- Check backend logs (stdout) for full yt-dlp and ffmpeg stderr when troubleshooting downloads or processing errors.
+- To reproduce download behavior locally, run the same subprocess command printed in logs (it uses `sys.executable -m yt_dlp ...`). Use `-v` for verbose yt-dlp output.
+- If yt-dlp fails with SSL CERTIFICATE_VERIFY_FAILED and video is public/unblocked: install certifi-win32 in venv (pip install certifi-win32).
+- If video is age/region-restricted: user uploads cookies.txt via frontend CookiesUpload; backend passes --cookies file to yt-dlp to authenticate.
+- If you modify a long-running process, restart uvicorn (reload is enabled but heavy edits may leave reloader in inconsistent state).
 
-**Validation:**
-- Pydantic validators in `schemas.py`: clip count (1-20), font size (12-120), timestamp >= 0
-- Frontend prevents invalid submissions; backend validates on ingestion
+What to update in this file
+- Keep this doc short. If you add persistent conventions (new env vars, new task states, or new external services) update the bullet list above and add an example command.
 
-## Common Implementation Tasks
+Questions? Ask for the specific backend log snippet (yt-dlp/ffmpeg command + stderr) and I'll point to the exact lines to change.
 
-**Adding new text styling options:** Update `TextPlacement` enum + `VideoRequest` fields in `schemas.py`, then adjust FFmpeg `drawtext` parameters in `video_processor.py`.
-
-**Changing default fonts:** Add `.ttf` files to `backend/fonts/`, update default in frontend settings component, ensure `video_processor.py` references correct path.
-
-**Modifying video processing flow:** Core logic is in `VideoProcessor.process_video_request()` → `_process_clip()` → FFmpeg command assembly. Progress updates use `_update_task_status()`.
-
-**Frontend status updates:** `useEffect` polls `/status/{task_id}` with exponential backoff; updates `progress`, `status`, `downloadUrl` state variables.
+---
+Files referenced: `backend/video_processor.py`, `backend/models/schemas.py`, `config/settings.py`, `utils/ai_client.py`, `frontend/app/page.tsx`, `frontend/components/CookiesUpload.tsx`

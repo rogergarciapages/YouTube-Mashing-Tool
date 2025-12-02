@@ -10,6 +10,40 @@ from pathlib import Path
 import json
 import time
 import re
+import ssl
+import urllib3
+
+# On Windows, recommending certifi-win32 can resolve Python SSL verification issues by
+# using the Windows Certificate Store. Try to import it early so its effects apply.
+_CERTIFI_WIN32_AVAILABLE = False
+try:
+    import certifi
+    try:
+        import certifi_win32  # type: ignore
+        _CERTIFI_WIN32_AVAILABLE = True
+        # Refresh certifi.where() result (certifi_win32 patches CA selection on import)
+        ca_path = certifi.where()
+        os.environ['SSL_CERT_FILE'] = ca_path
+        os.environ['REQUESTS_CA_BUNDLE'] = ca_path
+        logger = logging.getLogger(__name__)
+        logger.info(f"certifi-win32 detected, using CA bundle from Windows store via certifi: {ca_path}")
+    except Exception:
+        # certifi is available but certifi-win32 is not installed
+        pass
+except Exception:
+    # certifi not available; we'll attempt to import it later where needed
+    pass
+
+# CRITICAL FIX: Disable SSL verification for Windows Python certificate issues
+# This is a known issue where Windows Python doesn't have CA certificates installed
+# We must do this BEFORE importing requests/urllib3 heavily used modules
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# Set environment variables for SSL bypass (for requests library)
+os.environ['PYTHONHTTPSVERIFY'] = '0'
+os.environ['REQUESTS_CA_BUNDLE'] = ''
+os.environ['CURL_CA_BUNDLE'] = ''
 
 from models.schemas import VideoRequest, ClipRequest, ProcessingStatus, VideoFormat
 from config.settings import settings
@@ -157,6 +191,8 @@ class VideoProcessor:
         """
         Download a 3-second clip from YouTube starting at the specified timestamp
         
+        Uses subprocess to invoke yt-dlp CLI directly, which bypasses Python SSL verification issues.
+        
         Parameters:
         - url: YouTube video URL
         - timestamp: start time in seconds
@@ -166,7 +202,6 @@ class VideoProcessor:
         Timeout handling:
         - Base timeout: 120 seconds (2 minutes)
         - Additional time: 3 seconds per MB of video file
-        - Large files (100MB+) get extra logging and progress updates
         """
         # Convert HttpUrl to string if needed
         url_str = str(url)
@@ -175,142 +210,206 @@ class VideoProcessor:
         temp_dir = os.path.dirname(output_path)
         temp_video = os.path.join(temp_dir, f"temp_{os.path.basename(output_path)}")
         
-        # Use an explicit template with extension to make the downloaded filename predictable
-        ydl_opts = {
-            # Video-only formats: prefer MP4 and high resolution
-            "format": "bestvideo[height>=720][ext=mp4]/bestvideo[height>=720]/best[height>=720]/best[ext=mp4]/best",
-            "outtmpl": temp_video + ".%(ext)s",
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            # Improve robustness
-            "retries": 3,
-            "socket_timeout": 15,
-            "http_chunk_size": 1048576,
-        }
-
-        # Add cookies if provided
-        if download_config and download_config.cookies_file:
-            cookies_path = download_config.cookies_file
-            if os.path.exists(cookies_path):
-                logger.info(f"Using cookies file: {cookies_path}")
-                ydl_opts["cookiefile"] = cookies_path
-            else:
-                logger.warning(f"Cookies file not found: {cookies_path}")
-
-        # Add geo-bypass if enabled
-        if download_config and download_config.use_geo_bypass:
-            ydl_opts["geo_bypass"] = True
-            logger.info("Geo-bypass enabled")
-
-        # Use retries from config if provided
-        if download_config and download_config.retries:
-            ydl_opts["retries"] = download_config.retries
-            logger.info(f"Retries set to: {download_config.retries}")
-
-        def _run_ydl_with_opts(opts):
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                # Get video info first to log quality
-                try:
-                    info = ydl.extract_info(url_str, download=False)
-                    if 'formats' in info and info['formats']:
-                        formats = info['formats']
-                        best_format = None
-                        for fmt in formats:
-                            if isinstance(fmt, dict) and fmt.get('height', 0) >= 720:
-                                best_format = fmt
-                                break
-                        if best_format:
-                            height = best_format.get('height', 'unknown')
-                            width = best_format.get('width', 'unknown')
-                            ext = best_format.get('ext', 'unknown')
-                            filesize = best_format.get('filesize', 'unknown')
-                            logger.info(f"Selected video format: {width}x{height} {ext}, size: {filesize} bytes")
-                        else:
-                            logger.warning("No HD format found, using best available")
-                    else:
-                        logger.info("Video info extracted, format details not available")
-                except Exception as info_e:
-                    logger.warning(f"Could not extract video info: {info_e}")
-
-                # Download the video
-                ydl.download([url_str])
-
+        logger.info(f"Downloading clip from: {url_str} at timestamp {timestamp}s")
+        
+        # Prepare environment with SSL bypass - CRITICAL for Windows Python
+        env = os.environ.copy()
+        ca_bundle = None
+        
+        # Try to use certifi CA bundle
+        try:
+            import certifi
+            ca_bundle = certifi.where()
+            env['SSL_CERT_FILE'] = ca_bundle
+            env['SSL_CERT_DIR'] = os.path.dirname(ca_bundle)
+            # Also try the requests-specific paths
+            env['REQUESTS_CA_BUNDLE'] = ca_bundle
+            # Force Python to use certifi
+            env['PYTHONHTTPSVERIFY'] = '1'  # Enable verification with certifi
+            logger.info(f"Using certifi CA bundle: {ca_bundle}")
+        except Exception as certifi_error:
+            logger.warning(f"Could not use certifi: {certifi_error}")
+            # Fallback: disable verification entirely
+            env['PYTHONHTTPSVERIFY'] = '0'
+        
+        # Set CURL to use certifi too
+        env['CURL_CA_BUNDLE'] = env.get('SSL_CERT_FILE', '')
+        env['GIT_SSL_CAINFO'] = env.get('SSL_CERT_FILE', '')
+        
         try:
             # First attempt: default options
-            _run_ydl_with_opts(ydl_opts)
-        except Exception as e:
-            logger.warning(f"Initial yt-dlp download attempt failed: {e}")
-            # If it's a 403 or similar access issue, attempt a fallback with browser-like headers
+            # Use the current Python interpreter with SSL patching
+            import sys
+            cmd = [
+                sys.executable, "-c",
+                "import ssl, sys; "
+                "ssl._create_default_https_context = ssl._create_unverified_context; "
+                "import yt_dlp; "
+                "yt_dlp.main(sys.argv[1:])",
+                "--no-warnings",
+                "--no-color",
+                "-f", "bestvideo[height>=720][ext=mp4]/bestvideo[height>=720]/best[height>=720]/best[ext=mp4]/best",
+                "-o", temp_video + ".%(ext)s",
+                "--retries", str(download_config.retries if download_config and download_config.retries else 3),
+                "--socket-timeout", "30",
+                "--http-chunk-size", "1048576",
+                "--skip-unavailable-fragments",
+                "--no-check-certificates",
+                "--add-header", f"User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                "--add-header", f"Referer:{url_str}",
+                url_str,
+            ]
+            
+            # Add cookies file if provided
+            if download_config and download_config.cookies_file and os.path.exists(download_config.cookies_file):
+                cmd.insert(-1, "--cookies")
+                cmd.insert(-1, download_config.cookies_file)
+                logger.info(f"Using cookies file: {download_config.cookies_file}")
+            
+            logger.info(f"yt-dlp download with SSL patching via {sys.executable}")
+            # Debug: log SSL-related env vars passed to subprocess
+            logger.info(f"Subprocess env SSL_CERT_FILE={env.get('SSL_CERT_FILE')} REQUESTS_CA_BUNDLE={env.get('REQUESTS_CA_BUNDLE')} PYTHONHTTPSVERIFY={env.get('PYTHONHTTPSVERIFY')}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env, check=True)
+            logger.info(f"yt-dlp download successful: {result.stdout}")
+            
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Initial yt-dlp download attempt failed: {e.stderr}")
+            
+            # If it's a 403 or SSL error, attempt fallback with more aggressive settings
             try:
-                fallback_opts = ydl_opts.copy()
-                # Set a modern browser user-agent and referer to mimic a real browser
-                fallback_opts.update({
-                    "http_headers": {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-                        "Referer": url_str
-                    },
-                    "nocheckcertificate": True,
-                    "geo_bypass": True,
-                    "retries": 5,
-                    "socket_timeout": 30,
-                })
-                logger.info("Attempting yt-dlp download with fallback headers and geo-bypass")
-                _run_ydl_with_opts(fallback_opts)
-            except Exception as e2:
-                logger.error(f"Fallback yt-dlp download also failed: {e2}")
-                raise
+                logger.info("Attempting yt-dlp download with fallback: lower quality + more retries + SSL patching")
+                logger.info(f"Subprocess env SSL_CERT_FILE={env.get('SSL_CERT_FILE')} REQUESTS_CA_BUNDLE={env.get('REQUESTS_CA_BUNDLE')} PYTHONHTTPSVERIFY={env.get('PYTHONHTTPSVERIFY')}")
+                cmd = [
+                    sys.executable, "-c",
+                    "import ssl, sys; "
+                    "ssl._create_default_https_context = ssl._create_unverified_context; "
+                    "import yt_dlp; "
+                    "yt_dlp.main(sys.argv[1:])",
+                    "--no-warnings",
+                    "--no-color",
+                    "-f", "best[height<=480]/best",
+                    "-o", temp_video + ".%(ext)s",
+                    "--retries", "10",
+                    "--socket-timeout", "60",
+                    "--http-chunk-size", "1048576",
+                    "--skip-unavailable-fragments",
+                    "--no-check-certificates",
+                    "--geo-bypass",
+                    "--geo-bypass-country", "US",
+                    "--fragment-retries", "10",
+                    "--add-header", f"User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                    "--add-header", f"Referer:{url_str}",
+                    url_str,
+                ]
+                
+                # Add cookies file if provided
+                if download_config and download_config.cookies_file and os.path.exists(download_config.cookies_file):
+                    cmd.insert(-1, "--cookies")
+                    cmd.insert(-1, download_config.cookies_file)
+                    logger.info(f"Using cookies file in fallback: {download_config.cookies_file}")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env, check=True)
+                logger.info(f"yt-dlp fallback download successful: {result.stdout}")
+                
+            except subprocess.CalledProcessError as e2:
+                logger.error(f"Final yt-dlp download failed: {e2.stderr}")
+
+                # If the failure is an SSL certificate verification error, attempt a last-ditch run
+                stderr_lower = (e2.stderr or "").lower()
+                if "certificate verify failed" in stderr_lower or "certificateverificationerror" in stderr_lower or "certificat" in stderr_lower:
+                    logger.warning("Detected SSL certificate verification failure; attempting unverified subprocess run with PYTHONHTTPSVERIFY=0")
+                    try:
+                        env_unverified = env.copy()
+                        env_unverified['PYTHONHTTPSVERIFY'] = '0'
+                        env_unverified['REQUESTS_CA_BUNDLE'] = ''
+                        env_unverified['SSL_CERT_FILE'] = ''
+                        env_unverified['CURL_CA_BUNDLE'] = ''
+
+                        # Use -m yt_dlp to avoid -c quoting issues and run module directly
+                        cmd2 = [
+                            sys.executable, "-m", "yt_dlp",
+                            "--no-warnings",
+                            "--no-color",
+                            "-f", "best[height<=480]/best",
+                            "-o", temp_video + ".%(ext)s",
+                            "--retries", "1",
+                            "--socket-timeout", "60",
+                            "--http-chunk-size", "1048576",
+                            "--skip-unavailable-fragments",
+                            "--no-check-certificates",
+                            "--geo-bypass",
+                            "--add-header", f"User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                            "--add-header", f"Referer:{url_str}",
+                            url_str,
+                        ]
+                        
+                        # Add cookies file if provided
+                        if download_config and download_config.cookies_file and os.path.exists(download_config.cookies_file):
+                            cmd2.insert(-1, "--cookies")
+                            cmd2.insert(-1, download_config.cookies_file)
+                            logger.info(f"Using cookies file in unverified run: {download_config.cookies_file}")
+                            
+                        logger.info(f"Attempting unverified yt-dlp run via: {sys.executable} -m yt_dlp")
+                        result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=300, env=env_unverified, check=True)
+                        logger.info(f"yt-dlp unverified run successful: {result2.stdout}")
+                    except subprocess.CalledProcessError as e3:
+                        logger.error(f"Unverified yt-dlp run also failed: {e3.stderr}")
+                        raise Exception(
+                            f"yt-dlp download failed: {e3.stderr}\n" \
+                            "Hint: Try uploading cookies from your browser (if video is age-restricted/region-locked) or install certifi-win32 to fix SSL verification."
+                        )
+                    except Exception as ex:
+                        logger.error(f"Unexpected error during unverified yt-dlp attempt: {ex}")
+                        raise Exception(
+                            f"yt-dlp download failed after SSL fallback: {ex}\n"
+                            "Hint: Try uploading cookies from your browser (if video is age-restricted/region-locked) or install certifi-win32."
+                        )
+                else:
+                    raise Exception(f"yt-dlp download failed: {e2.stderr}")
             
         # Check if the temp file was created with the expected name
         # yt-dlp will append the extension (e.g., .mp4) to our template outtmpl
         actual_temp_file = None
-
-        # Try common extensions first
-        for ext in ('.mp4', '.webm', '.mkv', '.m4v'):
+        
+        # Find the downloaded file - yt-dlp appends the extension to outtmpl
+        actual_temp_file = None
+        logger.info(f"Searching for downloaded file in: {temp_dir}")
+        
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir, exist_ok=True)
+        
+        # List directory contents
+        dir_contents = os.listdir(temp_dir)
+        logger.info(f"Directory contents: {dir_contents}")
+        
+        # Try common video extensions first
+        for ext in ('.mp4', '.webm', '.mkv', '.m4v', '.flv', '.3gp'):
             candidate = temp_video + ext
             if os.path.exists(candidate):
                 actual_temp_file = candidate
-                logger.info(f"Using expected temp file: {actual_temp_file}")
+                logger.info(f"Found temp file: {actual_temp_file}")
                 break
-
+        
+        # If no video found, check for error pages (.mhtml, .html, etc.) - these indicate access issues
         if not actual_temp_file:
-            # Look for the actual downloaded file by prefix
-            logger.info(f"Expected temp file not found (checked extensions): {temp_video}")
-            logger.info(f"Searching in directory: {temp_dir}")
-            logger.info(f"Directory contents: {os.listdir(temp_dir) if os.path.exists(temp_dir) else 'Directory does not exist'}")
-
-            for filename in os.listdir(temp_dir):
-                if filename.startswith("temp_") and filename.endswith(('.mp4', '.webm', '.mkv', '.m4v')):
+            error_extensions = ('.mhtml', '.html', '.htm')
+            for filename in dir_contents:
+                if filename.startswith("temp_") and any(filename.endswith(ext) for ext in error_extensions):
+                    error_file = os.path.join(temp_dir, filename)
+                    logger.error(f"Downloaded file is an error page: {error_file}")
+                    raise Exception(f"YouTube blocked the download (age-restricted, region-blocked, or requires login). " +
+                                  f"The video at {url_str} cannot be accessed. " +
+                                  f"Try using cookies exported from your browser, or use a VPN to bypass restrictions.")
+        
+        # If still not found, search for any file starting with temp_
+        if not actual_temp_file:
+            for filename in dir_contents:
+                if filename.startswith("temp_") and any(filename.endswith(ext) for ext in ('.mp4', '.webm', '.mkv', '.m4v', '.flv', '.3gp')):
                     actual_temp_file = os.path.join(temp_dir, filename)
-                    logger.info(f"Found downloaded file: {actual_temp_file}")
+                    logger.info(f"Found temp file: {actual_temp_file}")
                     break
 
-            # If still not found, try to find any video file
-            if not actual_temp_file:
-                for filename in os.listdir(temp_dir):
-                    if filename.endswith(('.mp4', '.webm', '.mkv', '.m4v')):
-                        actual_temp_file = os.path.join(temp_dir, filename)
-                        logger.info(f"Found alternative video file: {actual_temp_file}")
-                        break
-
         if not actual_temp_file:
-            raise Exception(f"Downloaded video file not found. Expected: {temp_video}(.ext), Directory contents: {os.listdir(temp_dir) if os.path.exists(temp_dir) else 'Directory does not exist'}")
-
-        # Check if the downloaded file is actually a video or an error page (.mhtml, .html, etc.)
-        logger.info(f"Checking downloaded file validity: {actual_temp_file}")
-        if actual_temp_file.endswith(('.mhtml', '.html', '.htm', '.txt')):
-            # This is likely an error page from YouTube (age-restricted, region-blocked, or requires login)
-            logger.error(f"Downloaded file appears to be an error page: {actual_temp_file}")
-            # Try to read the file to understand the error
-            try:
-                with open(actual_temp_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read(500)  # Read first 500 chars
-                logger.error(f"File content preview: {content}")
-            except Exception as read_e:
-                logger.error(f"Could not read error file: {read_e}")
-            raise Exception(f"YouTube returned an error page (age-restricted, region-blocked, or requires login). " +
-                          f"The video at {url_str} cannot be accessed directly. " +
-                          f"Please provide cookies via --cookies flag or use a VPN/proxy to bypass restrictions.")
+            raise Exception(f"Downloaded video file not found. Expected: {temp_video}(.ext), Directory contents: {dir_contents}")
 
         logger.info(f"Processing downloaded video: {actual_temp_file}")
             

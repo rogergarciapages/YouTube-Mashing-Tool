@@ -5,6 +5,7 @@ import ClipForm from '../components/ClipForm'
 import ClipList from '../components/ClipList'
 import Settings from '../components/Settings'
 import ProgressBar from '../components/ProgressBar'
+import CookiesUpload from '../components/CookiesUpload'
 import { ClipRequest, VideoRequest, VideoFormat, TextPlacement } from '../types'
 
 export default function Home() {
@@ -18,6 +19,7 @@ export default function Home() {
     music: '',
     format: 'youtube' as VideoFormat
   })
+  const [cookiesFile, setCookiesFile] = useState<string | null>(null)
   const [isProcessing, setIsProcessing] = useState(false)
   const [backendStatus, setBackendStatus] = useState<'unknown' | 'healthy' | 'unhealthy'>('unknown')
   const [taskId, setTaskId] = useState<string | null>(null)
@@ -52,7 +54,8 @@ export default function Home() {
     try {
       const request: VideoRequest = {
         clips,
-        ...settings
+        ...settings,
+        download_config: cookiesFile ? { cookies_file: cookiesFile } : undefined
       }
 
       const baseUrl = process.env.NEXT_PUBLIC_API_URL || ''
@@ -179,6 +182,12 @@ export default function Home() {
             <Settings 
               settings={settings} 
               onSettingsChange={setSettings}
+            />
+            
+            <CookiesUpload
+              onCookiesUploaded={setCookiesFile}
+              onCookiesCleared={() => setCookiesFile(null)}
+              uploadedCookiesFile={cookiesFile}
             />
             
             <div className="card">

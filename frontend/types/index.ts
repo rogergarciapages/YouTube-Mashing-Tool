@@ -5,6 +5,12 @@ export interface ClipRequest {
   custom_text?: string
 }
 
+export interface DownloadConfig {
+  cookies_file?: string
+  use_geo_bypass?: boolean
+  retries?: number
+}
+
 export interface VideoRequest {
   clips: ClipRequest[]
   title: string
@@ -14,6 +20,7 @@ export interface VideoRequest {
   placement: TextPlacement
   music?: string
   format: VideoFormat
+  download_config?: DownloadConfig
 }
 
 export interface VideoResponse {

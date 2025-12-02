@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -6,6 +6,7 @@ import os
 import uuid
 from typing import List
 import logging
+import shutil
 
 from models.schemas import VideoRequest, VideoResponse, ProcessingStatus
 from video_processor import VideoProcessor
@@ -100,7 +101,7 @@ async def download_video(filename: str):
     """
     Download the final compiled video
     """
-    file_path = f"videos/{filename}"
+    file_path = os.path.join("videos/output", filename)
     
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Video file not found")
@@ -172,6 +173,38 @@ async def retry_task(task_id: str):
     except Exception as e:
         logger.error(f"Error retrying task {task_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/upload-cookies")
+async def upload_cookies(file: UploadFile = File(...)):
+    """
+    Upload a cookies.txt file to be used for video downloads.
+    Returns the path where the cookies file will be stored.
+    The frontend should include this path in the DownloadConfig.cookies_file field.
+    """
+    try:
+        # Create a temporary cookies directory if it doesn't exist
+        cookies_dir = os.path.join("videos", "temp", "cookies")
+        os.makedirs(cookies_dir, exist_ok=True)
+        
+        # Generate a unique filename for the cookies file
+        cookies_filename = f"cookies_{uuid.uuid4()}.txt"
+        cookies_path = os.path.join(cookies_dir, cookies_filename)
+        
+        # Save the uploaded file
+        with open(cookies_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        logger.info(f"Cookies file uploaded: {cookies_path}")
+        
+        return {
+            "message": "Cookies file uploaded successfully",
+            "cookies_file": cookies_path,
+            "filename": cookies_filename
+        }
+        
+    except Exception as e:
+        logger.error(f"Error uploading cookies file: {e}")
+        raise HTTPException(status_code=500, detail=f"Error uploading cookies file: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
