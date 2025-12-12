@@ -9,6 +9,7 @@ import subprocess
 import logging
 from typing import Optional
 import requests
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -21,23 +22,20 @@ def try_yt_dlp_standard(url: str, output_path: str, timeout: int = 180) -> bool:
     try:
         logger.info(f"[Strategy 1/4] Attempting yt-dlp standard download: {url}")
         
+        # Prepare environment with localized SSL bypass if needed
         env = os.environ.copy()
-        try:
-            import certifi
-            env['SSL_CERT_FILE'] = certifi.where()
-            env['REQUESTS_CA_BUNDLE'] = certifi.where()
-        except:
-            env['PYTHONHTTPSVERIFY'] = '0'
+        # Avoid certifying globally if possible, or handle specifically for subprocess
         
         cmd = [
             sys.executable, "-m", "yt_dlp",
             "--no-warnings", "--no-color",
-            "-f", "bestvideo[height>=720][ext=mp4]/bestvideo[height>=720]/best[height>=720]/best[ext=mp4]/best",
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best",
             "-o", output_path,
-            "--retries", "5",
+            "--merge-output-format", "mp4",
+            "--retries", str(settings.DOWNLOAD_RETRIES),
             "--socket-timeout", "30",
             "--http-chunk-size", "1048576",
-            "--no-check-certificates",
+            "--no-check-certificates", # Explicitly allow insecure for yt-dlp if needed
             "-q",  # Quiet mode
             url
         ]
@@ -58,18 +56,14 @@ def try_yt_dlp_with_scraping(url: str, output_path: str, timeout: int = 300) -> 
         logger.info(f"[Strategy 2/4] Attempting yt-dlp with scraping extractors: {url}")
         
         env = os.environ.copy()
-        try:
-            import certifi
-            env['SSL_CERT_FILE'] = certifi.where()
-        except:
-            env['PYTHONHTTPSVERIFY'] = '0'
+        # Localized SSL handling
         
         cmd = [
             sys.executable, "-m", "yt_dlp",
             "--no-warnings", "--no-color",
-            "-f", "best[height<=480]/best",
+            "-f", "best[ext=mp4]/best",
             "-o", output_path,
-            "--retries", "15",
+            "--retries", str(settings.DOWNLOAD_RETRIES * 3), # More retries for fallback
             "--socket-timeout", "60",
             "--http-chunk-size", "1048576",
             "--skip-unavailable-fragments",
@@ -161,7 +155,7 @@ def try_external_api(url: str, output_path: str) -> bool:
                     # cobalt.tools format
                     payload = {
                         "url": f"https://www.youtube.com/watch?v={video_id}",
-                        "vQuality": "360",
+                        "vQuality": "1080",
                         "aFormat": "mp4"
                     }
                     response = requests.post(api_url, json=payload, timeout=60)

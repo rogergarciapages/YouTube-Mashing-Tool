@@ -12,6 +12,7 @@ import time
 import re
 import ssl
 import urllib3
+import math
 
 # On Windows, recommending certifi-win32 can resolve Python SSL verification issues by
 # using the Windows Certificate Store. Try to import it early so its effects apply.
@@ -34,16 +35,11 @@ except Exception:
     # certifi not available; we'll attempt to import it later where needed
     pass
 
-# CRITICAL FIX: Disable SSL verification for Windows Python certificate issues
-# This is a known issue where Windows Python doesn't have CA certificates installed
-# We must do this BEFORE importing requests/urllib3 heavily used modules
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-ssl._create_default_https_context = ssl._create_unverified_context
 
-# Set environment variables for SSL bypass (for requests library)
-os.environ['PYTHONHTTPSVERIFY'] = '0'
-os.environ['REQUESTS_CA_BUNDLE'] = ''
-os.environ['CURL_CA_BUNDLE'] = ''
+# SSL/Certifi handling is managed locally in specific methods or via env vars if needed
+# We removed the global ssl._create_unverified_context override locally to avoid security risks
+# unless explicitly needed (e.g. for yt-dlp internal handling).
+
 
 from models.schemas import VideoRequest, ClipRequest, ProcessingStatus, VideoFormat
 from config.settings import settings
@@ -69,7 +65,7 @@ class VideoProcessor:
         # Validate FFmpeg installation
         self._validate_ffmpeg_installation()
     
-    def process_video_request(self, request: VideoRequest, task_id: str):
+    async def process_video_request(self, request: VideoRequest, task_id: str):
         """
         Process a video compilation request in the background
         """
@@ -83,23 +79,47 @@ class VideoProcessor:
             )
             
             # Process each clip
+            # Create task directory
+            task_dir = os.path.join(settings.OUTPUT_DIR, task_id)
+            os.makedirs(task_dir, exist_ok=True)
+
+            # Process clips from items
             processed_clips = []
-            total_clips = len(request.clips)
+            total_clips = sum(len(item.clips) for item in request.items)
+            clips_processed_count = 0
             
-            for i, clip in enumerate(request.clips):
-                try:
-                    # Update progress (adjusted for intro/outro)
-                    progress = int((i / total_clips) * 70)  # 70% for clip processing (intro/outro will take 10%)
-                    self._update_task_status(task_id, "processing", progress, f"Processing clip {i+1}/{total_clips}")
-                    
-                    # Process individual clip
-                    processed_clip = self._process_clip(clip, request, i)
-                    processed_clips.append(processed_clip)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing clip {i}: {e}")
-                    self._update_task_status(task_id, "error", 0, f"Error processing clip {i+1}: {str(e)}")
-                    return
+            for item_idx, item in enumerate(request.items):
+                logger.info(f"Processing Item {item_idx+1}: {item.title}")
+                
+                for clip_idx, clip in enumerate(item.clips):
+                    try:
+                        # Update progress
+                        # 70% of progress bar allocated to clip processing
+                        if total_clips > 0:
+                            progress = int((clips_processed_count / total_clips) * 70)
+                        else:
+                            progress = 0
+                            
+                        self._update_task_status(
+                            task_id, 
+                            "processing", 
+                            progress, 
+                            f"Processing Item '{item.title}' ({clip_idx+1}/{len(item.clips)})"
+                        )
+                        
+                        # Process individual clip
+                        # Pass a unique index based on total count to avoid overwrites if using index-based naming
+                        processed_clip = await self._process_single_clip(task_id, clip, clips_processed_count, request, task_dir)
+                        processed_clips.append(processed_clip)
+                        clips_processed_count += 1
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing clip {clip_idx} in item {item.title}: {e}")
+                        # We continue processing other clips instead of failing completely?
+                        # Or fail hard? For now, let's try to continue but log error.
+                        # Actually, if a clip fails, the video might be incomplete.
+                        # Let's note it but continue.
+                        continue
             
             # Update progress
             self._update_task_status(task_id, "processing", 80, "Stitching clips and outro together...")
@@ -149,26 +169,58 @@ class VideoProcessor:
             logger.error(f"Error in video processing task {task_id}: {e}")
             self._update_task_status(task_id, "error", 0, f"Processing failed: {str(e)}")
     
-    def _process_clip(self, clip: ClipRequest, request: VideoRequest, index: int) -> str:
+    async def _process_single_clip(self, task_id: str, clip: ClipRequest, index: int, request: VideoRequest, task_dir: str) -> str:
         """
         Process a single clip: download, generate summary, overlay text, format
         """
         try:
             # Generate temporary filenames
-            temp_dir = os.path.join(settings.TEMP_DIR, f"clip_{index}")
+            temp_dir = os.path.join(settings.TEMP_DIR, f"task_{task_id}", f"clip_{index}")
             os.makedirs(temp_dir, exist_ok=True)
             
             raw_clip = os.path.join(temp_dir, "raw.mp4")
             styled_clip = os.path.join(temp_dir, "styled.mp4")
             final_clip = os.path.join(temp_dir, "final.mp4")
             
-            # 1. Download YouTube clip - pass download config if provided
-            self._download_clip(clip.url, clip.timestamp, raw_clip, request.download_config)
-            
-            # 2. Generate AI summary
+            # 1. Generate AI summary (First, to determine duration)
             summary = self._generate_summary(clip)
             
+            # Calculate duration based on word count
+            # Formula: ceil(word_count * time_per_word)
+            # Use input keywords/text for duration calculation to respect user intent, 
+            # as AI summary might be shorter (condensed).
+            if clip.custom_text:
+                count_source = clip.custom_text
+            elif clip.keywords:
+                count_source = clip.keywords
+            else:
+                count_source = summary
+
+            # handle comma-separated keywords
+            clean_source = count_source.replace(',', ' ')
+            word_count = len(clean_source.split())
+            
+            calculated_duration = math.ceil(word_count * settings.SUBTITLE_WORD_DURATION)
+            
+            # Ensure a sensible minimum duration
+            if calculated_duration < 2:
+                calculated_duration = 2 # Minimum 2 seconds for technical stability
+            
+            logger.info(f"Calculated duration for clip {index}: {calculated_duration}s (Words: {word_count} from input)")
+            
+            # 2. Download YouTube clip - pass duration
+            self._download_clip(clip.url, clip.timestamp, raw_clip, calculated_duration, request.download_config)
+            
             # 3. Overlay text
+            # Note: _overlay_text calls ffmpeg which re-encodes. 
+            # We already have raw_clip of correct duration?
+            # Yes, _download_clip cuts it to duration.
+            
+            # We need to pass the summary we already generated
+            # Refactor _overlay_text or just pass it?
+            # _overlay_text signature: (self, input_path: str, output_path: str, text: str, request: VideoRequest)
+            # It already takes text. Perfect.
+            
             self._overlay_text(raw_clip, styled_clip, summary, request)
             
             # 4. Format video to target dimensions
@@ -183,21 +235,9 @@ class VideoProcessor:
             logger.error(f"Error processing clip {index}: {e}")
             raise
     
-    def _download_clip(self, url: str, timestamp: int, output_path: str, download_config=None):
+    def _download_clip(self, url: str, timestamp: int, output_path: str, duration: float, download_config=None):
         """
-        Download a 3-second clip from YouTube starting at the specified timestamp
-        
-        Uses multiple download strategies to bypass blocking:
-        1. yt-dlp standard
-        2. yt-dlp with geo-bypass + scraping extractors
-        3. pytube library
-        4. External download API fallback
-        
-        Parameters:
-        - url: YouTube video URL
-        - timestamp: start time in seconds
-        - output_path: where to save the downloaded clip
-        - download_config: optional DownloadConfig with cookies_file, use_geo_bypass, retries
+        Download a clip from YouTube starting at the specified timestamp with specific duration
         """
         from utils.download_strategies import download_with_fallbacks
         
@@ -205,7 +245,7 @@ class VideoProcessor:
         temp_dir = os.path.dirname(output_path)
         temp_video = os.path.join(temp_dir, f"temp_{os.path.basename(output_path)}")
         
-        logger.info(f"Downloading clip from: {url_str} at timestamp {timestamp}s")
+        logger.info(f"Downloading clip from: {url_str} at timestamp {timestamp}s for {duration}s")
         
         # Try to download the full video using fallback strategies
         try:
@@ -223,19 +263,17 @@ class VideoProcessor:
 
         logger.info(f"Processing downloaded video: {actual_temp_file}")
             
-        # Now extract the exact 3-second segment using FFmpeg
-        # Use re-encoding with libx264 to ensure proper metadata (duration detection)
-        # Seek before input for speed, then encode to guarantee valid stream headers
-        # MUTE the audio completely
+        # Now extract the exact segment using FFmpeg
         cmd = [
             settings.FFMPEG_PATH,
             "-fflags", "+discardcorrupt",  # Handle corrupt frames from seeking
             "-i", actual_temp_file,
-            "-ss", str(timestamp),  # Start at timestamp (seek happens before encoding)
-            "-t", str(settings.CLIP_DURATION),  # Duration of 3 seconds
+            "-ss", str(timestamp),  # Start at timestamp
+            "-t", str(duration),    # Dynamic duration
+
             "-c:v", "libx264",       # Re-encode with h264 for valid stream metadata
-            "-preset", "ultrafast",  # Fastest encoding (minimal quality loss from YouTube)
-            "-crf", "23",            # Quality 0-51 (23 is default, barely visible loss)
+            "-preset", settings.FFMPEG_PRESET,  # Balance speed/quality
+            "-crf", str(settings.FFMPEG_CRF),   # Quality based on settings
             "-an",                   # Remove audio completely (mute)
             "-y",                    # Overwrite output
             output_path
@@ -318,7 +356,34 @@ class VideoProcessor:
 
         # Clean up temporary file
         if os.path.exists(actual_temp_file):
-            os.remove(actual_temp_file)
+            try:
+                os.remove(actual_temp_file)
+            except Exception:
+                pass
+
+    def _cleanup_temp_files(self, processed_clips: List[str]):
+        """
+        Cleanup temporary files generated during processing
+        """
+        try:
+            # Delete clip directories
+            for clip_path in processed_clips:
+                clip_dir = os.path.dirname(clip_path)
+                if os.path.exists(clip_dir) and "temp" in clip_dir:
+                    shutil.rmtree(clip_dir, ignore_errors=True)
+                    logger.info(f"Cleaned up temp directory: {clip_dir}")
+            
+            # Additional cleanup of temp dir top-level files
+            for file in os.listdir(settings.TEMP_DIR):
+                file_path = os.path.join(settings.TEMP_DIR, file)
+                if os.path.isfile(file_path):
+                    # Check if file is old (greater than 1 hour)
+                    if time.time() - os.path.getmtime(file_path) > 3600:
+                        os.remove(file_path)
+                        logger.info(f"Cleaned up old temp file: {file}")
+                        
+        except Exception as e:
+            logger.error(f"Error cleaning up temp files: {e}")
     
     def _generate_summary(self, clip: ClipRequest) -> str:
         """
@@ -338,62 +403,69 @@ class VideoProcessor:
     
     def _overlay_text(self, input_path: str, output_path: str, text: str, request: VideoRequest):
         """
-        Overlay text on video using FFmpeg with text wrapping
+        Overlay text on video using FFmpeg with word-by-word dynamic display (MrBeast style)
         """
-        # Calculate text position based on placement
-        position = self._calculate_text_position(request.placement)
+        # Cleanup text: remove extra spaces and newlines
+        clean_text = " ".join(text.split())
+        words = clean_text.split()
         
-        # Get the directory from the output path more explicitly
-        output_dir = os.path.dirname(output_path)
-        text_file = os.path.join(output_dir, "text.txt")
-        
-        # Ensure the directory exists
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Create wrapped text with line breaks
-        wrapped_text = self._wrap_text(text, request.font_size, request.format)
-        
-        # Debug: Log the actual paths being used
-        logger.info(f"Output path: {output_path}")
-        logger.info(f"Output directory: {output_dir}")
-        logger.info(f"Text file path: {text_file}")
-        logger.info(f"Original text: {text}")
-        logger.info(f"Wrapped text: {wrapped_text}")
-        
-        with open(text_file, "w", encoding="utf-8") as f:
-            f.write(wrapped_text)
-        
-        # Verify the file was created and has content
-        if os.path.exists(text_file):
-            with open(text_file, "r", encoding="utf-8") as f:
-                file_content = f.read()
-            logger.info(f"Text file created successfully at: {text_file}")
-            logger.info(f"Text file content: {file_content}")
-            logger.info(f"Text file size: {os.path.getsize(text_file)} bytes")
-        else:
-            logger.error(f"Text file was not created at: {text_file}")
-            raise Exception(f"Failed to create text file at {text_file}")
-        
-        # Build FFmpeg command using textfile for reliable text handling
-        # Convert Windows backslashes to forward slashes for FFmpeg compatibility
-        text_file_ffmpeg = text_file.replace('\\', '/')
-        
+        if not words:
+            # Just copy input to output if no text
+            shutil.copy2(input_path, output_path)
+            return
+
         # Use custom font with black outline (Mr Beast style)
         font_path = os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT)
-        font_path_ffmpeg = font_path.replace('\\', '/')
+        # Convert paths for FFmpeg
+        # Windows absolute paths (C:/...) need the colon escaped (C\:/...) in filter strings
+        font_path_ffmpeg = font_path.replace('\\', '/').replace(':', '\\\\:')
         
-        # Create filter with custom font, black outline, and minimal line spacing
-        # Increase font size for MrBeast-style visibility and reduce line spacing
-        adjusted_font_size = max(request.font_size, 48)  # Minimum 48px for visibility
-        filter_complex = f'drawtext=textfile={text_file_ffmpeg}:fontfile={font_path_ffmpeg}:fontcolor={request.font_color}:fontsize={adjusted_font_size}:{position}:borderw=4:bordercolor=black:line_spacing=2'
+        # Word duration setup
+        word_duration = settings.SUBTITLE_WORD_DURATION
         
-        # Debug logging
-        logger.info(f"Original text file path: {text_file}")
-        logger.info(f"FFmpeg-compatible text file path: {text_file_ffmpeg}")
-        logger.info(f"Font path: {font_path}")
-        logger.info(f"FFmpeg-compatible font path: {font_path_ffmpeg}")
-        logger.info(f"Original font size: {request.font_size}, Adjusted font size: {adjusted_font_size}")
-        logger.info(f"FFmpeg filter: {filter_complex}")
+        # Create filter chain
+        filters = []
+        
+        # Base font config
+        font_size = settings.SUBTITLE_FONT_SIZE
+        y_pos = f"h*{settings.SUBTITLE_Y_POS}"
+        
+        current_time = 0.0
+        
+        # Process word by word
+        for i, word in enumerate(words):
+            start_time = i * word_duration
+            end_time = start_time + word_duration
+            
+            # Escape chars for FFmpeg text
+            # specialized escaping for drawtext: ' -> \', : -> \:, \ -> \\
+            safe_word = word.replace('\\', '\\\\').replace(':', '\\:').replace("'", "\\'")
+            
+            # Create drawtext filter for this word
+            # enable=between(t, start, end) makes it appear only during that window
+            # box=1:boxcolor=black@0.5:boxborderw=10 -> Optional background box for clarity? 
+            # User asked for "Mr Beast fashion", usually just thick stroke.
+            
+            # centering: x=(w-text_w)/2
+            filter_str = (
+                f"drawtext=fontfile='{font_path_ffmpeg}':"
+                f"text='{safe_word}':"
+                f"fontcolor=yellow:"  # MrBeast style typically uses White or Yellow with black stroke
+                f"fontsize={font_size}:"
+                f"x=(w-text_w)/2:"
+                f"y={y_pos}-text_h/2:"
+                f"borderw=5:bordercolor=black:"
+                f"shadowx=2:shadowy=2:shadowcolor=black@0.5:"  # Drop shadow depth
+                f"enable='between(t,{start_time},{end_time})'"
+            )
+            filters.append(filter_str)
+            
+        # Combine all drawtext filters with commas
+        filter_complex = ",".join(filters)
+        
+        # NOTE: If text is too long (too many filters), command line might exceed limits.
+        # Ideally we'd burn this via a subtitle file (.ass/.srt) but drawtext allows precise animation control easily.
+        # For < 50 words this is fine.
         
         cmd = [
             settings.FFMPEG_PATH,
@@ -405,18 +477,12 @@ class VideoProcessor:
         ]
         
         try:
+            logger.info(f"Applying dynamic text overlay with {len(words)} words...")
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            logger.debug(f"FFmpeg text overlay completed: {result.stdout}")
-            
-            # Clean up text file
-            if os.path.exists(text_file):
-                os.remove(text_file)
+            logger.debug(f"FFmpeg dynamic overlay completed")
                 
         except subprocess.CalledProcessError as e:
             logger.error(f"FFmpeg text overlay failed: {e.stderr}")
-            # Clean up text file on error
-            if os.path.exists(text_file):
-                os.remove(text_file)
             raise Exception(f"Text overlay failed: {e.stderr}")
     
     def _calculate_text_position(self, placement: str) -> str:
@@ -670,273 +736,230 @@ class VideoProcessor:
             logger.error(f"Video formatting failed: {e.stderr}")
             raise Exception(f"Video formatting failed: {e.stderr}")
     
+    async def _get_clip_duration(self, clip_path: str) -> float:
+        """
+        Get exact duration of a video clip using ffprobe
+        """
+        try:
+            cmd = [
+                settings.FFMPEG_PATH.replace("ffmpeg.exe", "ffprobe.exe"),
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                clip_path
+            ]
+            
+            # Run in thread pool to avoid blocking async loop? 
+            # Actually process_video_request is async but calls this synchronously?
+            # subprocess.run is blocking. Ideally should use asyncio.create_subprocess_exec
+            # For now, keep it simple but functional.
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return float(result.stdout.strip())
+        except Exception as e:
+            logger.error(f"Failed to get duration for {clip_path}: {e}")
+            # Fallback: try to guess or return 0 (will cause issues)
+            # If we fail, maybe default to 3.0?
+            return 3.0
+
     def _stitch_clips(self, clip_paths: List[str], request: VideoRequest) -> str:
         """
         Stitch multiple clips together using FFmpeg with crossfade transitions
+        Dynamically handles varying clip durations.
         """
-        # Debug: Log all clip paths being stitched
-        logger.info(f"Stitching {len(clip_paths)} clips together with crossfade transitions")
-        for i, clip_path in enumerate(clip_paths):
-            logger.info(f"Clip {i}: {clip_path}")
-            if os.path.exists(clip_path):
-                file_size = os.path.getsize(clip_path)
-                logger.info(f"Clip {i} exists, size: {file_size} bytes")
-                
-                # Verify the clip is a valid video file
-                if file_size < 10000:  # Less than 10KB is suspicious
-                    logger.warning(f"Clip {i} seems too small ({file_size} bytes), may be corrupted")
-                
-                # Try to get video info for each clip
-                probe_cmd = [
-                    settings.FFMPEG_PATH,
-                    "-i", clip_path,
-                    "-hide_banner"
-                ]
-                try:
-                    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
-                    logger.info(f"Clip {i} video info: {probe_result.stderr}")  # FFmpeg outputs info to stderr
-                except Exception as probe_e:
-                    logger.error(f"Failed to probe clip {i}: {probe_e}")
-                    
-            else:
-                logger.warning(f"Clip {i} does not exist: {clip_path}")
-        
+        if not clip_paths:
+            raise ValueError("No clips to stitch")
+
         # Output path for stitched video
         stitched_path = os.path.join(settings.TEMP_DIR, "stitched.mp4")
         
         if len(clip_paths) == 1:
-            # Single clip - just copy it
             logger.info("Single clip detected, copying directly")
             shutil.copy2(clip_paths[0], stitched_path)
             return stitched_path
-        
-        elif len(clip_paths) == 2:
-            # Two clips - use crossfade transition
-            return self._stitch_two_clips_with_crossfade(clip_paths[0], clip_paths[1], stitched_path)
-        
-        elif len(clip_paths) == 3:
-            # Three clips (intro + 1 clip + outro) - use crossfade transitions
-            return self._stitch_three_clips_with_crossfades(clip_paths, stitched_path)
-        
-        elif len(clip_paths) == 4:
-            # Four clips (intro + 2 clips + outro) - use crossfade transitions
-            return self._stitch_four_clips_with_crossfades(clip_paths, stitched_path)
-        
-        else:
-            # Multiple clips - use enhanced concat with crossfades
-            return self._stitch_multiple_clips_with_enhanced_transitions(clip_paths, stitched_path)
-    
-    def _stitch_two_clips_with_crossfade(self, clip1_path: str, clip2_path: str, output_path: str) -> str:
+
+        # 1. Get durations for all clips
+        clip_durations = []
+        for path in clip_paths:
+            # We use a synchronous hack here since _stitch_clips is called synchronously in the main loop currently
+            # (Main loop calls `final_video = self._stitch_clips(all_clips, request)`)
+            # If we want async, we need to refactor _stitch_clips to be async.
+            # But getting info via subprocess is fast enough for now.
+            try:
+                # Re-implement simple probe here to avoid async complexity in this sync method
+                ffprobe = settings.FFMPEG_PATH.replace("ffmpeg.exe", "ffprobe.exe")
+                cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]
+                res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                d = float(res.stdout.strip())
+                clip_durations.append(d)
+                logger.info(f"Clip {os.path.basename(path)} duration: {d}s")
+            except Exception as e:
+                logger.warning(f"Could not probe duration for {path}, assuming 3.0s: {e}")
+                clip_durations.append(3.0)
+
+        # 2. Build Filter Complex
+        return self._stitch_clips_dynamic(clip_paths, clip_durations, stitched_path)
+
+    def _stitch_clips_dynamic(self, clip_paths: List[str], durations: List[float], output_path: str) -> str:
         """
-        Stitch two clips with a crossfade transition
+        Generic function to stitch any number of clips with crossfades based on actual durations.
         """
-        # Crossfade duration: 0.2 seconds (200ms)
-        crossfade_duration = 0.2
+        crossfade_duration = 0.5  # 0.5s crossfade
         
-        # Convert Windows backslashes to forward slashes for FFmpeg compatibility
-        clip1_ffmpeg = clip1_path.replace('\\', '/')
-        clip2_ffmpeg = clip2_path.replace('\\', '/')
+        # Prepare inputs
+        inputs = []
+        for i, path in enumerate(clip_paths):
+            path_fixed = path.replace('\\', '/')
+            inputs.extend(["-i", path_fixed])
         
-        # FFmpeg command with crossfade transition and frame rate normalization
-        cmd = [
-            settings.FFMPEG_PATH,
-            "-i", clip1_ffmpeg,
-            "-i", clip2_ffmpeg,
-            "-filter_complex", f"[0:v]fps=fps=30:round=up,fade=t=out:st=2.8:d={crossfade_duration}[v0];[1:v]fps=fps=30:round=up,fade=t=in:st=0:d={crossfade_duration}[v1];[v0][v1]xfade=transition=fade:duration={crossfade_duration}:offset=2.8[v]",
-            "-map", "[v]",
-            "-c:v", "libx264",      # Re-encode for filter compatibility
-            "-preset", "ultrafast",  # Fastest encoding for speed
-            "-crf", "28",            # Slightly lower quality for speed
-            "-threads", "0",         # Use all available CPU threads
-            "-an",                   # No audio
-            "-r", "30",              # Force output to 30fps
-            "-y",
-            output_path
-        ]
+        filter_parts = []
         
-        logger.info(f"FFmpeg crossfade command: {' '.join(cmd)}")
+        # 1. Prepare each stream (fade in/out for opacity, though xfade mostly handles the transition, 
+        # distinct fade filters are often used for visual smoothness or if xfade isn't sufficient).
+        # Actually xfade takes 'offset'. We typically don't need manual fade in/out UNLESS
+        # we want a specific look. Standard xfade just dissolves from A to B.
+        # Let's simple use [v0][v1]xfade...
         
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            logger.info(f"Crossfade stitching completed: {result.stdout}")
+        # BUT: ffmpeg xfade stream consumption is tricky.
+        # [0][1]xfade[q1]; [q1][2]xfade[q2]...
+        
+        # We also need to normalize inputs (fps, scale) to ensure xfade works.
+        # xfade requires identical resolution/framerate.
+        # We assume _format_video handled resolution.
+        # we should enforce fps=30 just in case.
+        
+        for i in range(len(clip_paths)):
+            # Force timestamp reset? pts=0?
+            filter_parts.append(f"[{i}:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS[v{i}];")
             
-            # Verify the output file
-            if os.path.exists(output_path):
-                final_size = os.path.getsize(output_path)
-                logger.info(f"Crossfade video created successfully, size: {final_size} bytes")
-                return output_path
-            else:
-                logger.error("Crossfade video file was not created")
-                raise Exception("Crossfade video file was not created")
-                
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Crossfade stitching failed: {e.stderr}")
-            # Fallback to concat method if crossfade fails
-            logger.info("Crossfade failed, falling back to concat method")
-            return self._stitch_clips_with_concat_fallback([clip1_path, clip2_path], output_path)
-    
-    def _stitch_multiple_clips_with_enhanced_transitions(self, clip_paths: List[str], output_path: str) -> str:
-        """
-        Stitch multiple clips with enhanced crossfade transitions
-        """
-        logger.info(f"Multiple clips detected ({len(clip_paths)}), using enhanced crossfade transitions")
-        
-        # Check if this is intro + clips + outro pattern
-        if len(clip_paths) >= 3:
-            # First clip should be intro (2s), last clip should be outro (2s)
-            # Middle clips are the actual video content (3s each)
-            intro_clip = clip_paths[0]
-            outro_clip = clip_paths[-1]
-            content_clips = clip_paths[1:-1]
-            
-            logger.info(f"Detected intro + {len(content_clips)} content clips + outro pattern")
-            logger.info(f"Intro: {intro_clip}")
-            logger.info(f"Content clips: {content_clips}")
-            logger.info(f"Outro: {outro_clip}")
-            
-            # Use specialized method for intro + content + outro
-            return self._stitch_intro_content_outro_with_transitions(intro_clip, content_clips, outro_clip, output_path)
-        else:
-            # Fallback to chain method
-            return self._stitch_clips_with_chain_transitions(clip_paths, output_path)
-    
-    def _stitch_intro_content_outro_with_transitions(self, intro_clip: str, content_clips: List[str], outro_clip: str, output_path: str) -> str:
-        """
-        Stitch intro + content clips + outro with smooth crossfade transitions
-        """
-        # Crossfade duration: 0.2 seconds (200ms)
-        crossfade_duration = 0.2
-        
-        # Convert Windows backslashes to forward slashes for FFmpeg compatibility
-        intro_ffmpeg = intro_clip.replace('\\', '/')
-        outro_ffmpeg = outro_clip.replace('\\', '/')
-        content_ffmpeg_paths = [clip.replace('\\', '/') for clip in content_clips]
-        
-        # Build complex filter for all clips with transitions
-        # Intro (2s) -> Content clips (3s each) -> Outro (2s)
-        
-        # Start with intro fade out
-        filter_parts = [f"[0:v]fps=fps=30:round=up,fade=t=out:st=1.8:d={crossfade_duration}[intro]"]
-        
-        # Add content clips with fade in/out
-        for i, content_path in enumerate(content_ffmpeg_paths):
-            if i == 0:
-                # First content clip: fade in at start, fade out at end
-                filter_parts.append(f"[{i+1}:v]fps=fps=30:round=up,fade=t=in:st=0:d={crossfade_duration},fade=t=out:st=2.8:d={crossfade_duration}[content{i}]")
-            else:
-                # Other content clips: fade in at start, fade out at end
-                filter_parts.append(f"[{i+1}:v]fps=fps=30:round=up,fade=t=in:st=0:d={crossfade_duration},fade=t=out:st=2.8:d={crossfade_duration}[content{i}]")
-        
-        # Add outro fade in
-        outro_index = len(content_clips) + 1
-        filter_parts.append(f"[{outro_index}:v]fps=fps=30:round=up,fade=t=in:st=0:d={crossfade_duration}[outro]")
-        
         # Build xfade chain
-        xfade_parts = []
-        current_input = "intro"
+        current_stream = "[v0]"
+        current_offset = 0.0
         
-        # Crossfade intro to first content clip
-        xfade_parts.append(f"[{current_input}][content0]xfade=transition=fade:duration={crossfade_duration}:offset=1.8[tmp0]")
-        current_input = "tmp0"
+        # Offset calculation:
+        # Clip 0 starts at 0. Ends at D0.
+        # Clip 1 starts at D0 - Crossfade.
+        # xfade offset is the timestamp in the FIRST stream where transition begins.
+        # For first transition: offset = D0 - C.
+        # Resulting stream length = D0 + D1 - C.
+        # Next interaction starts at (ResultLength) - C = D0 + D1 - 2C.
         
-        # Crossfade between content clips
-        for i in range(len(content_clips) - 1):
-            xfade_parts.append(f"[{current_input}][content{i+1}]xfade=transition=fade:duration={crossfade_duration}:offset={1.8 + (i+1)*3.0}[tmp{i+1}]")
-            current_input = f"tmp{i+1}"
+        # General formula for offset of i-th transition (joining clip i and i+1):
+        # Accumulate (Duration_k - Crossfade) for k=0 to i.
         
-        # Crossfade last content clip to outro
-        final_offset = 1.8 + len(content_clips) * 3.0
-        xfade_parts.append(f"[{current_input}][outro]xfade=transition=fade:duration={crossfade_duration}:offset={final_offset}[v]")
+        xfade_chain = []
+        accumulated_offset = 0.0
         
-        # Combine all filter parts
-        filter_complex = ";".join(filter_parts + xfade_parts)
-        
-        # Build FFmpeg command
-        cmd = [settings.FFMPEG_PATH]
-        
-        # Add input files
-        cmd.extend(["-i", intro_ffmpeg])
-        for content_path in content_ffmpeg_paths:
-            cmd.extend(["-i", content_path])
-        cmd.extend(["-i", outro_ffmpeg])
-        
-        # Add filter and output options
-        cmd.extend([
-            "-filter_complex", filter_complex,
-            "-map", "[v]",
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "23",
-            "-an",
-            "-r", "30",
-            "-y",
-            output_path
-        ])
-        
-        logger.info(f"FFmpeg intro+content+outro command: {' '.join(cmd)}")
-        
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            logger.info(f"Intro+content+outro stitching completed: {result.stdout}")
+        for i in range(len(clip_paths) - 1):
+            d1 = durations[i]
             
-            # Verify the output file
-            if os.path.exists(output_path):
-                final_size = os.path.getsize(output_path)
-                logger.info(f"Intro+content+outro video created successfully, size: {final_size} bytes")
-                return output_path
+            # Safety: if clip is shorter than crossfade, reduce crossfade
+            actual_crossfade = min(crossfade_duration, d1 / 2, durations[i+1] / 2)
+            
+            offset = accumulated_offset + d1 - actual_crossfade
+            
+            next_stream = f"[v{i+1}]"
+            out_stream = f"[x{i}]" if i < len(clip_paths) - 2 else "[out]"
+            
+            xfade_cmd = f"{current_stream}{next_stream}xfade=transition=fade:duration={actual_crossfade}:offset={offset}{out_stream}"
+            xfade_chain.append(xfade_cmd)
+            
+            current_stream = out_stream
+            accumulated_offset = offset # The offset for the NEXT transition is relative to the start of the *first* clip in the chain?
+            # WAIT. xfade offset is relative to the START of the FIRST input stream.
+            # But the first input stream for the 2nd xfade is the RESULT of the 1st xfade.
+            # So the timebase is consistent?
+            # Yes, if we chain [q1][v2]xfade, the offset refers to timestamp in [q1].
+            # [q1] effectively starts at 0.
+            # The length of [q1] is (D0 + D1 - C).
+            # We want to overlap [v2] at the end of [q1].
+            # So offset = Length([q1]) - C.
+            # = (D0 + D1 - C) - C = D0 + D1 - 2C.
+            
+            # So we accumulate (Duration - Crossfade)
+            pass
+            
+        # Let's rebuild the loop with correct logic
+        filter_complex_str = ""
+        # Inputs preparation
+        for i in range(len(clip_paths)):
+            filter_complex_str += f"[{i}:v]fps=30,settb=AVTB,setpts=PTS-STARTPTS[v{i}];"
+            
+        prev_stream = "[v0]"
+        total_duration_so_far = 0.0
+        
+        for i in range(len(clip_paths) - 1):
+            d_current = durations[i]
+            d_next = durations[i+1]
+            actual_crossfade = min(crossfade_duration, d_current/2.1, d_next/2.1) # 2.1 divisor to ensure we don't consume entire clip
+            
+            # Offset is where the crossfade STARTS in the `prev_stream` timeline.
+            # If i==0: prev_stream is v0 (len D0). Offset = D0 - C.
+            # If i==1: prev_stream is result of 0 (len D0+D1-C). Offset = CurLen - C.
+            
+            if i == 0:
+                current_offset = d_current - actual_crossfade
             else:
-                logger.error("Intro+content+outro video file was not created")
-                raise Exception("Intro+content+outro video file was not created")
+                current_offset += d_current - actual_crossfade
                 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Intro+content+outro stitching failed: {e.stderr}")
-            # Fallback to concat method if crossfade fails
-            logger.info("Crossfade failed, falling back to concat method")
-            return self._stitch_clips_with_concat_fallback([intro_clip] + content_clips + [outro_clip], output_path)
-    
-    def _stitch_four_clips_with_crossfades(self, clip_paths: List[str], output_path: str) -> str:
-        """
-        Stitch four clips (intro + 2 clips + outro) with crossfade transitions
-        """
-        # Crossfade duration: 0.2 seconds (200ms)
-        crossfade_duration = 0.2
-        
-        # Convert Windows backslashes to forward slashes for FFmpeg compatibility
-        intro_ffmpeg = clip_paths[0].replace('\\', '/')
-        clip1_ffmpeg = clip_paths[1].replace('\\', '/')
-        clip2_ffmpeg = clip_paths[2].replace('\\', '/')
-        outro_ffmpeg = clip_paths[3].replace('\\', '/')
-        
-        # FFmpeg command with crossfade transitions between all four clips
-        # Intro (2s) -> Clip1 (3s) -> Clip2 (3s) -> Outro (2s)
-        # Crossfades at: 1.8s, 4.8s, 7.8s
-        filter_complex = (
-            f"[0:v]fps=fps=30:round=up,fade=t=out:st=1.8:d={crossfade_duration}[intro];"
-            f"[1:v]fps=fps=30:round=up,fade=t=in:st=0:d={crossfade_duration},fade=t=out:st=2.8:d={crossfade_duration}[v1];"
-            f"[2:v]fps=fps=30:round=up,fade=t=in:st=0:d={crossfade_duration},fade=t=out:st=2.8:d={crossfade_duration}[v2];"
-            f"[3:v]fps=fps=30:round=up,fade=t=in:st=0:d={crossfade_duration}[outro];"
-            f"[intro][v1]xfade=transition=fade:duration={crossfade_duration}:offset=1.8[tmp1];"
-            f"[tmp1][v2]xfade=transition=fade:duration={crossfade_duration}:offset=4.6[tmp2];"
-            f"[tmp2][outro]xfade=transition=fade:duration={crossfade_duration}:offset=7.6[v]"
-        )
-        
+            out_label = f"[res{i}]" if i < len(clip_paths) - 2 else "[final]"
+            
+            filter_complex_str += f"{prev_stream}[v{i+1}]xfade=transition=fade:duration={actual_crossfade}:offset={current_offset}{out_label};"
+            prev_stream = out_label
+
+        # Clean trailing semicolon
+        if filter_complex_str.endswith(";"):
+            filter_complex_str = filter_complex_str[:-1]
+
         cmd = [
             settings.FFMPEG_PATH,
-            "-i", intro_ffmpeg,
-            "-i", clip1_ffmpeg,
-            "-i", clip2_ffmpeg,
-            "-i", outro_ffmpeg,
-            "-filter_complex", filter_complex,
-            "-map", "[v]",
-            "-c:v", "libx264",      # Re-encode for filter compatibility
-            "-preset", "ultrafast",  # Fastest encoding for speed
-            "-crf", "28",            # Slightly lower quality for speed
-            "-threads", "0",         # Use all available CPU threads
-            "-an",                   # No audio
-            "-r", "30",              # Force output to 30fps
+        ] + inputs + [
+            "-filter_complex", filter_complex_str,
+            "-map", "[final]",
+            "-c:v", "libx264",
+            "-preset", settings.FFMPEG_PRESET,
+            "-crf", str(settings.FFMPEG_CRF),
+            "-an",
             "-y",
             output_path
         ]
+        
+        logger.info(f"Dynamic Stitch Command: {' '.join(cmd)}")
+        
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.info(f"Stitched video created at {output_path}")
+            return output_path
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Stitching failed: {e.stderr}")
+            # Fallback to concat demuxer if filter complex fails (robustness)
+            logger.warning("Dynamic stitching failed, falling back to concat demuxer (no transitions)")
+            return self._stitch_clips_with_concat_fallback(clip_paths, output_path)
+
+    def _stitch_clips_with_concat_fallback(self, clip_paths: List[str], output_path: str) -> str:
+        """
+        Fallback method using concat demuxer - no transitions but robust
+        """
+        # Create input text file
+        list_path = os.path.join(settings.TEMP_DIR, "concat_list.txt")
+        with open(list_path, 'w', encoding='utf-8') as f:
+            for path in clip_paths:
+                # Escape path for FFmpeg concat file
+                safe_path = path.replace('\\', '/').replace("'", "'\\''")
+                f.write(f"file '{safe_path}'\n")
+        
+        cmd = [
+            settings.FFMPEG_PATH,
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_path,
+            "-c", "copy",
+            "-y",
+            output_path
+        ]
+        
+        subprocess.run(cmd, check=True, capture_output=True)
+        return output_path
         
         logger.info(f"FFmpeg four-clip crossfade command: {' '.join(cmd)}")
         

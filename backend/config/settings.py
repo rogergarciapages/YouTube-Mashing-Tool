@@ -81,6 +81,16 @@ class Settings:
     # Processing Configuration
     MAX_PROCESSING_TIME: int = 300  # 5 minutes
     CLEANUP_TEMP_FILES: bool = True
+    DOWNLOAD_RETRIES: int = 3
+    
+    # Quality Configuration
+    FFMPEG_PRESET: str = "medium"  # Balance between speed and compression
+    FFMPEG_CRF: int = 20           # Quality (lower is better, 18-28 is standard)
+    
+    # Subtitle Configuration
+    SUBTITLE_WORD_DURATION: float = 0.5  # Seconds per word
+    SUBTITLE_FONT_SIZE: int = 30         # Smaller font size (approx 60% smaller than 96)
+    SUBTITLE_Y_POS: float = 0.8          # 80% down the screen
 
 def get_settings() -> Settings:
     return Settings()

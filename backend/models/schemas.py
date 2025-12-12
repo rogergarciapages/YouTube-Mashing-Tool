@@ -30,8 +30,13 @@ class DownloadConfig(BaseModel):
     use_geo_bypass: bool = True  # Whether to use geo-bypass
     retries: int = 3  # Number of retries
 
-class VideoRequest(BaseModel):
+class VideoItem(BaseModel):
+    title: str  # e.g. "Rolex"
+    order: int
     clips: List[ClipRequest]
+
+class VideoRequest(BaseModel):
+    items: List[VideoItem]
     title: str = "Amazing Video Compilation"  # Default title for intro
     font: str = "Arial"
     font_size: int = 36
@@ -41,12 +46,15 @@ class VideoRequest(BaseModel):
     format: VideoFormat = VideoFormat.youtube
     download_config: Optional[DownloadConfig] = None  # Optional cookies/download settings
     
-    @validator('clips')
-    def validate_clips(cls, v):
+    @validator('items')
+    def validate_items(cls, v):
         if not v:
-            raise ValueError('At least one clip must be provided')
-        if len(v) > 20:
-            raise ValueError('Maximum 20 clips allowed')
+            raise ValueError('At least one item must be provided')
+        total_clips = sum(len(item.clips) for item in v)
+        if total_clips > 50:
+            raise ValueError('Maximum 50 clips allowed total')
+        if total_clips == 0:
+            raise ValueError('Items must contain at least one clip')
         return v
     
     @validator('font_size')
