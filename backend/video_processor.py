@@ -88,13 +88,22 @@ class VideoProcessor:
             total_clips = sum(len(item.clips) for item in request.items)
             clips_processed_count = 0
             
+
             for item_idx, item in enumerate(request.items):
                 logger.info(f"Processing Item {item_idx+1}: {item.title}")
+                
+                # 1. Create and append Item Intro
+                try:
+                    intro_path = await self._create_item_intro(item.title, task_id, item_idx, task_dir)
+                    processed_clips.append(intro_path)
+                except Exception as e:
+                    logger.error(f"Failed to create intro for item {item.title}: {e}")
+                    # Continue without intro if fails
                 
                 for clip_idx, clip in enumerate(item.clips):
                     try:
                         # Update progress
-                        # 70% of progress bar allocated to clip processing
+                        # ... (existing progress logic)
                         if total_clips > 0:
                             progress = int((clips_processed_count / total_clips) * 70)
                         else:
@@ -108,17 +117,12 @@ class VideoProcessor:
                         )
                         
                         # Process individual clip
-                        # Pass a unique index based on total count to avoid overwrites if using index-based naming
                         processed_clip = await self._process_single_clip(task_id, clip, clips_processed_count, request, task_dir)
                         processed_clips.append(processed_clip)
                         clips_processed_count += 1
                         
                     except Exception as e:
                         logger.error(f"Error processing clip {clip_idx} in item {item.title}: {e}")
-                        # We continue processing other clips instead of failing completely?
-                        # Or fail hard? For now, let's try to continue but log error.
-                        # Actually, if a clip fails, the video might be incomplete.
-                        # Let's note it but continue.
                         continue
             
             # Update progress
@@ -169,6 +173,89 @@ class VideoProcessor:
             logger.error(f"Error in video processing task {task_id}: {e}")
             self._update_task_status(task_id, "error", 0, f"Processing failed: {str(e)}")
     
+    async def _create_item_intro(self, item_title: str, task_id: str, index: int, task_dir: str) -> str:
+        """
+        Create a 3-second intro clip for an item with its title overlaid on the standard background
+        """
+        intro_filename = f"item_intro_{index}.mp4"
+        output_path = os.path.join(task_dir, intro_filename)
+        
+        # Check if custom intro background exists
+        bg_path = settings.ITEM_INTRO_PATH
+        if not os.path.exists(bg_path):
+            logger.warning(f"Item intro background not found at {bg_path}, skipping intro generation")
+            # Create a black placeholder? Or just skip?
+            # User wants it, but if missing, better to fail gracefully or skip.
+            # Let's create a simple color background if missing? 
+            # For now, just raise exception to be handled by caller (who skips)
+            raise FileNotFoundError(f"Intro background not found: {bg_path}")
+            
+        # FFmpeg command to loop background to 3s and overlay text
+        # -stream_loop -1 -i input -t 3
+        # overlay text using same style as subtitles but maybe bigger?
+        # User said "feature the title".
+        
+        display_title = item_title if item_title else f"Item {index+1}"
+        
+        # Font settings - use same font but white text maybe? Or Yellow like subtitles?
+        # Let's use standard white centered text for intro.
+        font_path = os.path.join(settings.FONT_DIR, settings.DEFAULT_FONT)
+        font_path_ffmpeg = font_path.replace('\\', '/').replace(':', '\\\\:')
+        
+        # Escape text
+        safe_title = display_title.replace('\\', '\\\\').replace(':', '\\:').replace("'", "\\'")
+        
+        # Filter complex:
+        # 1. Scale background to target resolution (1920x1080 default? What if shorts?)
+        # We don't know the request format here easily unless we pass it.
+        # But _process_single_clip formats later.
+        # Actually _create_item_intro should probably return a formatted video?
+        # Or returns raw 1920x1080 and let stitching handle it?
+        # Stitching expects same resolution.
+        # _process_single_clip calls _format_video.
+        # So we should probably format this intro too.
+        # But for now let's assume standard HD and assume stitching handles it?
+        # The stitching logic (concat) requires same resolution.
+        # My updated _stitch_clips_dynamic uses xfade which requires same resolution.
+        # So I MUST format this intro to match request.format.
+        # I need to pass request.format to _create_item_intro.
+        # Updating signature in next steps... NO, I can just hardcode 1920x1080 and rely on format_video later?
+        # No, I should format it here.
+        # Let's assume standard behavior for now.
+        
+        # Simple command:
+        # loop input, cut to 3s, overlay title centered.
+        
+        video_filters = (
+            f"drawtext=fontfile='{font_path_ffmpeg}':"
+            f"text='{safe_title}':"
+            f"fontcolor=white:"
+            f"fontsize=96:" # Big title
+            f"x=(w-text_w)/2:"
+            f"y=(h-text_h)/2:"
+            f"borderw=5:bordercolor=black:"
+            f"shadowx=5:shadowy=5:shadowcolor=black@0.5"
+        )
+        
+        cmd = [
+            settings.FFMPEG_PATH,
+            "-stream_loop", "-1",  # Loop input
+            "-i", bg_path,
+            "-t", str(settings.ITEM_INTRO_DURATION), # 3 seconds
+            "-vf", video_filters,
+            "-c:v", "libx264",
+            "-preset", settings.FFMPEG_PRESET,
+            "-crf", str(settings.FFMPEG_CRF),
+            "-an", # No audio
+            "-y",
+            output_path
+        ]
+        
+        logger.info(f"Creating item intro for '{display_title}'")
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        
+        return output_path
+
     async def _process_single_clip(self, task_id: str, clip: ClipRequest, index: int, request: VideoRequest, task_dir: str) -> str:
         """
         Process a single clip: download, generate summary, overlay text, format

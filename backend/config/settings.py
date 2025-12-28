@@ -91,6 +91,10 @@ class Settings:
     SUBTITLE_WORD_DURATION: float = 0.5  # Seconds per word
     SUBTITLE_FONT_SIZE: int = 30         # Smaller font size (approx 60% smaller than 96)
     SUBTITLE_Y_POS: float = 0.8          # 80% down the screen
+    
+    # Intro Configuration
+    ITEM_INTRO_PATH: str = r"C:\Users\a867985\OneDrive - Atos\Documentos\GitHub\YTTool\backend\videos\introitem\introitem.mp4"
+    ITEM_INTRO_DURATION: int = 3         # Seconds
 
 def get_settings() -> Settings:
     return Settings()
