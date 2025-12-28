@@ -129,17 +129,15 @@ class VideoProcessor:
             self._update_task_status(task_id, "processing", 80, "Stitching clips and outro together...")
             
             # Skip intro - start directly with first content clip
-            self._update_task_status(task_id, "processing", 77, "Creating outro sequence...")
-            outro_clip = self._create_outro_clip(processed_clips[0], request)
+            self._update_task_status(task_id, "processing", 80, "Stitching clips together...")
             
-            # Combine clips + outro (no intro)
-            all_clips = processed_clips + [outro_clip]
+            # Combine clips (no outro)
+            all_clips = processed_clips
             
             # Debug logging for clip combination
             logger.info(f"Combining clips for stitching (intro skipped):")
             for i, clip in enumerate(processed_clips):
                 logger.info(f"Content clip {i}: {clip} (exists: {os.path.exists(clip)})")
-            logger.info(f"Outro clip: {outro_clip} (exists: {os.path.exists(outro_clip)})")
             logger.info(f"Total clips to stitch: {len(all_clips)}")
             
             # Stitch all clips together
@@ -272,10 +270,7 @@ class VideoProcessor:
             # 1. Generate AI summary (First, to determine duration)
             summary = self._generate_summary(clip)
             
-            # Calculate duration based on word count
-            # Formula: ceil(word_count * time_per_word)
-            # Use input keywords/text for duration calculation to respect user intent, 
-            # as AI summary might be shorter (condensed).
+            # Calculate duration based on word count (0.5s per word, min 3s)
             if clip.custom_text:
                 count_source = clip.custom_text
             elif clip.keywords:
@@ -287,13 +282,14 @@ class VideoProcessor:
             clean_source = count_source.replace(',', ' ')
             word_count = len(clean_source.split())
             
-            calculated_duration = math.ceil(word_count * settings.SUBTITLE_WORD_DURATION)
+            # Formula: word_count * 0.5s
+            calculated_duration = word_count * settings.SUBTITLE_WORD_DURATION
             
-            # Ensure a sensible minimum duration
-            if calculated_duration < 2:
-                calculated_duration = 2 # Minimum 2 seconds for technical stability
+            # Enforce minimum duration of 3s (settings.CLIP_DURATION)
+            if calculated_duration < settings.CLIP_DURATION:
+                calculated_duration = float(settings.CLIP_DURATION)
             
-            logger.info(f"Calculated duration for clip {index}: {calculated_duration}s (Words: {word_count} from input)")
+            logger.info(f"Calculated duration for clip {index}: {calculated_duration}s (Words: {word_count}, Rate: {settings.SUBTITLE_WORD_DURATION}s/word, Min: {settings.CLIP_DURATION}s)")
             
             # 2. Download YouTube clip - pass duration
             self._download_clip(clip.url, clip.timestamp, raw_clip, calculated_duration, request.download_config)
@@ -884,8 +880,8 @@ class VideoProcessor:
                 logger.warning(f"Could not probe duration for {path}, assuming 3.0s: {e}")
                 clip_durations.append(3.0)
 
-        # 2. Build Filter Complex
-        return self._stitch_clips_dynamic(clip_paths, clip_durations, stitched_path)
+        # 2. Use simple concatenation to preserve exact duration
+        return self._stitch_clips_with_concat_fallback(clip_paths, stitched_path)
 
     def _stitch_clips_dynamic(self, clip_paths: List[str], durations: List[float], output_path: str) -> str:
         """
