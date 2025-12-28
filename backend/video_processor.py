@@ -92,13 +92,13 @@ class VideoProcessor:
             for item_idx, item in enumerate(request.items):
                 logger.info(f"Processing Item {item_idx+1}: {item.title}")
                 
-                # 1. Create and append Item Intro
-                try:
-                    intro_path = await self._create_item_intro(item.title, task_id, item_idx, task_dir)
-                    processed_clips.append(intro_path)
-                except Exception as e:
-                    logger.error(f"Failed to create intro for item {item.title}: {e}")
-                    # Continue without intro if fails
+                # 1. Create and append Item Intro - REMOVED per user request
+                # try:
+                #     intro_path = await self._create_item_intro(item.title, task_id, item_idx, task_dir)
+                #     processed_clips.append(intro_path)
+                # except Exception as e:
+                #     logger.error(f"Failed to create intro for item {item.title}: {e}")
+                #     # Continue without intro if fails
                 
                 for clip_idx, clip in enumerate(item.clips):
                     try:
